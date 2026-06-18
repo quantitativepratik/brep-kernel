@@ -1,8 +1,8 @@
 //! Half-edge topology for closed manifold B-reps.
 
-use crate::geometry::{Cylinder, Plane};
+use crate::geometry::{Circle, Cylinder, Plane};
 use crate::math::{Point3, Vec2, Vec3};
-use crate::nurbs::NurbsSurface;
+use crate::nurbs::{NurbsCurve, NurbsSurface};
 use std::collections::HashMap;
 
 /// Vertex identifier.
@@ -45,6 +45,106 @@ pub struct HalfEdge {
 pub struct Edge {
     /// One of the two half-edges.
     pub halfedge: HalfEdgeId,
+    /// Model-space curve supporting this edge.
+    pub curve: EdgeCurve3D,
+    /// Geometric tolerance for endpoint checks and later edge classification.
+    pub tolerance: f64,
+}
+
+/// Model-space curve carried by a topological edge.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EdgeCurve3D {
+    /// Straight segment from `start` to `end`.
+    LineSegment {
+        /// Start point in model space.
+        start: Point3,
+        /// End point in model space.
+        end: Point3,
+    },
+    /// Circular arc in a 3D plane.
+    CircularArc {
+        /// Arc center.
+        center: Point3,
+        /// Unit normal for the circle plane.
+        normal: Vec3,
+        /// Arc radius.
+        radius: f64,
+        /// Start angle in radians in the circle's deterministic frame.
+        start_angle: f64,
+        /// End angle in radians in the circle's deterministic frame.
+        end_angle: f64,
+    },
+    /// NURBS curve.
+    Nurbs(Box<NurbsCurve>),
+    /// Piecewise-linear model-space curve.
+    Polyline {
+        /// Ordered points.
+        points: Vec<Point3>,
+    },
+    /// Topological edge exists, but its model-space curve has not been fitted yet.
+    Unresolved,
+}
+
+impl EdgeCurve3D {
+    /// Construct a straight segment.
+    pub fn line_segment(start: Point3, end: Point3) -> Self {
+        Self::LineSegment { start, end }
+    }
+
+    /// Return start and end points if the model-space curve has explicit endpoints.
+    pub fn endpoints(&self) -> Option<(Point3, Point3)> {
+        match self {
+            Self::LineSegment { start, end } => Some((*start, *end)),
+            Self::CircularArc {
+                center,
+                normal,
+                radius,
+                start_angle,
+                end_angle,
+            } => {
+                let circle = Circle::new(*center, *normal, *radius);
+                Some((circle.point_at(*start_angle), circle.point_at(*end_angle)))
+            }
+            Self::Nurbs(curve) => {
+                let (u0, u1) = curve.domain();
+                Some((curve.evaluate(u0), curve.evaluate(u1)))
+            }
+            Self::Polyline { points } => Some((*points.first()?, *points.last()?)),
+            Self::Unresolved => None,
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        match self {
+            Self::LineSegment { start, end } => finite_point3(*start) && finite_point3(*end),
+            Self::CircularArc {
+                center,
+                normal,
+                radius,
+                start_angle,
+                end_angle,
+            } => {
+                finite_point3(*center)
+                    && finite_point3(*normal)
+                    && normal.norm() > f64::EPSILON
+                    && radius.is_finite()
+                    && *radius > 0.0
+                    && start_angle.is_finite()
+                    && end_angle.is_finite()
+            }
+            Self::Nurbs(curve) => {
+                let (u0, u1) = curve.domain();
+                u0.is_finite()
+                    && u1.is_finite()
+                    && finite_point3(curve.evaluate(u0))
+                    && finite_point3(curve.evaluate(u1))
+            }
+            Self::Polyline { points } => {
+                points.len() >= 2 && points.iter().all(|point| finite_point3(*point))
+            }
+            Self::Unresolved => true,
+        }
+    }
 }
 
 /// Analytic support surface for a face.
@@ -295,6 +395,12 @@ pub enum TopologyError {
     BoundaryEdge(VertexId, VertexId),
     /// Half-edge links are inconsistent.
     BrokenHalfEdge(HalfEdgeId),
+    /// An edge id does not exist.
+    InvalidEdge(EdgeId),
+    /// An edge's model-space curve is malformed.
+    InvalidEdgeCurve(EdgeId),
+    /// An edge curve's endpoints do not match its topological vertices.
+    EdgeCurveEndpointMismatch(EdgeId),
     /// A face id does not exist.
     InvalidFace(FaceId),
     /// A face is missing exactly one outer trim loop.
@@ -384,7 +490,13 @@ impl Solid {
             let edge_id = edges.len();
             halfedges[halfedge].edge = edge_id;
             halfedges[twin].edge = edge_id;
-            edges.push(Edge { halfedge });
+            let start = vertices[halfedges[halfedge].origin].point;
+            let end = vertices[halfedges[halfedges[halfedge].next].origin].point;
+            edges.push(Edge {
+                halfedge,
+                curve: EdgeCurve3D::line_segment(start, end),
+                tolerance: DEFAULT_EDGE_TOLERANCE,
+            });
         }
 
         let mut solid = Self {
@@ -445,7 +557,37 @@ impl Solid {
                 return Err(TopologyError::BrokenHalfEdge(id));
             }
         }
+        self.validate_edge_curves()?;
         self.validate_trim_topology()?;
+        Ok(())
+    }
+
+    /// Validate model-space curves attached to topological edges.
+    pub fn validate_edge_curves(&self) -> Result<(), TopologyError> {
+        for (edge_id, edge) in self.edges.iter().enumerate() {
+            if edge.halfedge >= self.halfedges.len()
+                || self.halfedges[edge.halfedge].edge != edge_id
+            {
+                return Err(TopologyError::InvalidEdge(edge_id));
+            }
+            if !edge.tolerance.is_finite() || edge.tolerance < 0.0 || !edge.curve.is_valid() {
+                return Err(TopologyError::InvalidEdgeCurve(edge_id));
+            }
+            let Some((curve_start, curve_end)) = edge.curve.endpoints() else {
+                continue;
+            };
+            let Some((origin, destination)) = self.edge_points(edge_id) else {
+                return Err(TopologyError::InvalidEdge(edge_id));
+            };
+            let tolerance = edge.tolerance.max(DEFAULT_EDGE_TOLERANCE);
+            let forward = curve_start.distance(origin) <= tolerance
+                && curve_end.distance(destination) <= tolerance;
+            let reverse = curve_start.distance(destination) <= tolerance
+                && curve_end.distance(origin) <= tolerance;
+            if !forward && !reverse {
+                return Err(TopologyError::EdgeCurveEndpointMismatch(edge_id));
+            }
+        }
         Ok(())
     }
 
@@ -501,6 +643,99 @@ impl Solid {
             return Err(error);
         }
         Ok(())
+    }
+
+    /// Replace an edge's model-space support curve.
+    pub fn set_edge_curve(
+        &mut self,
+        edge: EdgeId,
+        curve: EdgeCurve3D,
+        tolerance: f64,
+    ) -> Result<(), TopologyError> {
+        if edge >= self.edges.len() {
+            return Err(TopologyError::InvalidEdge(edge));
+        }
+        let old_curve = core::mem::replace(&mut self.edges[edge].curve, curve);
+        let old_tolerance = core::mem::replace(&mut self.edges[edge].tolerance, tolerance);
+        if let Err(error) = self.validate_edge_curves() {
+            self.edges[edge].curve = old_curve;
+            self.edges[edge].tolerance = old_tolerance;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Replace the 2D p-curve for one face-side use of a topological edge.
+    pub fn set_trim_curve(
+        &mut self,
+        face: FaceId,
+        halfedge: HalfEdgeId,
+        curve: TrimCurve2D,
+        tolerance: f64,
+    ) -> Result<(), TopologyError> {
+        if face >= self.faces.len() {
+            return Err(TopologyError::InvalidFace(face));
+        }
+        if halfedge >= self.halfedges.len() || self.halfedges[halfedge].face != face {
+            return Err(TopologyError::InvalidTrimHalfEdge(face, halfedge));
+        }
+        let Some((loop_index, trim_index)) = self.find_trim(face, halfedge) else {
+            return Err(TopologyError::InvalidTrimHalfEdge(face, halfedge));
+        };
+
+        let old_curve = core::mem::replace(
+            &mut self.faces[face].trim_loops[loop_index].trims[trim_index].curve,
+            curve,
+        );
+        let old_tolerance = core::mem::replace(
+            &mut self.faces[face].trim_loops[loop_index].trims[trim_index].tolerance,
+            tolerance,
+        );
+        if let Err(error) = self.validate_trim_topology() {
+            self.faces[face].trim_loops[loop_index].trims[trim_index].curve = old_curve;
+            self.faces[face].trim_loops[loop_index].trims[trim_index].tolerance = old_tolerance;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Return the model-space endpoint vertex ids for an edge.
+    pub fn edge_vertices(&self, edge: EdgeId) -> Option<(VertexId, VertexId)> {
+        let halfedge = self.edges.get(edge)?.halfedge;
+        Some((
+            self.halfedges.get(halfedge)?.origin,
+            self.halfedges
+                .get(self.halfedges.get(halfedge)?.next)?
+                .origin,
+        ))
+    }
+
+    /// Return the model-space endpoint points for an edge.
+    pub fn edge_points(&self, edge: EdgeId) -> Option<(Point3, Point3)> {
+        let (origin, destination) = self.edge_vertices(edge)?;
+        Some((
+            self.vertices.get(origin)?.point,
+            self.vertices.get(destination)?.point,
+        ))
+    }
+
+    /// Return the p-curve for a face-side half-edge trim.
+    pub fn trim_curve_for_halfedge(
+        &self,
+        face: FaceId,
+        halfedge: HalfEdgeId,
+    ) -> Option<&TrimCurve2D> {
+        let (loop_index, trim_index) = self.find_trim(face, halfedge)?;
+        Some(
+            &self
+                .faces
+                .get(face)?
+                .trim_loops
+                .get(loop_index)?
+                .trims
+                .get(trim_index)?
+                .curve,
+        )
     }
 
     /// Count trim loops by `(outer, inner)` role.
@@ -676,6 +911,18 @@ impl Solid {
         Ok(())
     }
 
+    fn find_trim(&self, face: FaceId, halfedge: HalfEdgeId) -> Option<(usize, usize)> {
+        let face = self.faces.get(face)?;
+        for (loop_index, trim_loop) in face.trim_loops.iter().enumerate() {
+            for (trim_index, trim) in trim_loop.trims.iter().enumerate() {
+                if trim.halfedge == Some(halfedge) {
+                    return Some((loop_index, trim_index));
+                }
+            }
+        }
+        None
+    }
+
     fn classify_planar_faces(&mut self) {
         for face_id in 0..self.faces.len() {
             let tri = self.face_vertices(face_id);
@@ -719,6 +966,7 @@ pub fn triangle_normal(points: &[Point3], tri: [usize; 3]) -> Vec3 {
     (b - a).cross(c - a).normalized()
 }
 
+const DEFAULT_EDGE_TOLERANCE: f64 = 1.0e-9;
 const DEFAULT_TRIM_TOLERANCE: f64 = 1.0e-9;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -737,6 +985,10 @@ fn plane_frame(plane: Plane) -> (Vec3, Vec3) {
 
 fn finite_vec2(value: Vec2) -> bool {
     value.x.is_finite() && value.y.is_finite()
+}
+
+fn finite_point3(value: Point3) -> bool {
+    value.x.is_finite() && value.y.is_finite() && value.z.is_finite()
 }
 
 fn vec2_distance(a: Vec2, b: Vec2) -> f64 {
