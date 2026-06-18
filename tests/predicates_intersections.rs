@@ -7,6 +7,7 @@ use brep_kernel::intersection::{
 use brep_kernel::math::{Point3, Vec2, Vec3};
 use brep_kernel::nurbs::{NurbsCurve, NurbsSurface};
 use brep_kernel::predicates::{incircle2d, orient2d, orient2d_fast, orient3d, RobustSign};
+use brep_kernel::topology::{EdgeCurve3D, TrimCurve2D};
 
 #[test]
 fn interval_orientation_certifies_easy_cases() {
@@ -104,19 +105,70 @@ fn plane_nurbs_surface_marching_finds_contour_segments() {
 fn nurbs_nurbs_surface_intersection_finds_curved_curve() {
     let a = parabolic_x_surface();
     let b = complementary_y_surface();
-    let polylines = intersect_nurbs_surfaces(&a, &b, 24, 24, 1.0e-7);
-    assert!(!polylines.is_empty());
-    assert!(polylines.iter().any(|polyline| polyline.points.len() >= 8));
-    assert!(polylines
-        .iter()
-        .all(|polyline| polyline.max_residual < 1.0e-5));
+    let curves = intersect_nurbs_surfaces(&a, &b, 24, 24, 1.0e-7);
+    assert!(!curves.is_empty());
+    assert!(curves.iter().any(|curve| curve.points.len() >= 8));
+    assert!(curves.iter().all(|curve| curve.max_residual < 1.0e-5));
 
-    let total_points: usize = polylines.iter().map(|polyline| polyline.points.len()).sum();
+    let total_points: usize = curves.iter().map(|curve| curve.points.len()).sum();
     assert!(total_points >= 20);
-    for point in polylines.iter().flat_map(|polyline| &polyline.points) {
+    for curve in &curves {
+        assert_trim_ready_curve(curve);
+    }
+    for sample in curves.iter().flat_map(|curve| &curve.points) {
+        let point = sample.point;
         assert!((point.x * point.x + point.y * point.y - 0.25).abs() < 1.0e-3);
         assert!((point.z - point.x * point.x).abs() < 1.0e-3);
         assert!((point.z - (0.25 - point.y * point.y)).abs() < 1.0e-3);
+        assert!((0.0..=1.0).contains(&sample.a_uv.x));
+        assert!((0.0..=1.0).contains(&sample.a_uv.y));
+        assert!((0.0..=1.0).contains(&sample.b_uv.x));
+        assert!((0.0..=1.0).contains(&sample.b_uv.y));
+    }
+}
+
+fn assert_trim_ready_curve(curve: &brep_kernel::intersection::TrimReadyIntersectionCurve) {
+    assert_eq!(curve.to_polyline().points.len(), curve.points.len());
+    match &curve.edge_curve {
+        EdgeCurve3D::LineSegment { start, end } => {
+            assert_eq!(curve.points.len(), 2);
+            assert_eq!(*start, curve.points[0].point);
+            assert_eq!(*end, curve.points[1].point);
+        }
+        EdgeCurve3D::Polyline { points } => {
+            assert_eq!(points.len(), curve.points.len());
+            assert_eq!(points[0], curve.points[0].point);
+        }
+        other => panic!("unexpected trim-ready edge curve: {other:?}"),
+    }
+    assert_pcurve_matches_samples(&curve.a_pcurve, &curve.points, true);
+    assert_pcurve_matches_samples(&curve.b_pcurve, &curve.points, false);
+}
+
+fn assert_pcurve_matches_samples(
+    pcurve: &TrimCurve2D,
+    samples: &[brep_kernel::intersection::SurfaceSurfaceIntersectionPoint],
+    first_surface: bool,
+) {
+    let uv = |index: usize| {
+        if first_surface {
+            samples[index].a_uv
+        } else {
+            samples[index].b_uv
+        }
+    };
+    match pcurve {
+        TrimCurve2D::LineSegment { start, end } => {
+            assert_eq!(samples.len(), 2);
+            assert_eq!(*start, uv(0));
+            assert_eq!(*end, uv(1));
+        }
+        TrimCurve2D::Polyline { points } => {
+            assert_eq!(points.len(), samples.len());
+            assert_eq!(points[0], uv(0));
+            assert_eq!(points[points.len() - 1], uv(samples.len() - 1));
+        }
+        other => panic!("unexpected trim-ready p-curve: {other:?}"),
     }
 }
 

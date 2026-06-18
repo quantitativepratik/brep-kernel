@@ -9,7 +9,7 @@ Initial public prototype:
 - 3D edge curves plus per-face 2D p-curves
 - NURBS curve/surface evaluation and derivatives
 - interval-filtered robust predicates
-- representative curve/surface and surface/surface intersections
+- representative curve/surface intersections and trim-ready NURBS/NURBS SSI output
 - cube-minus-cylinder boolean reference case
 - natural-language to parametric feature-tree layer
 - golden reference models and property-based tests

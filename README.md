@@ -40,7 +40,7 @@ Then open `http://localhost:8080/web/`.
   - plane-plane
   - NURBS-curve/plane via bracketing and bisection
   - plane/NURBS-surface via marching squares over the parametric domain
-  - NURBS/NURBS surface intersection via tessellated discovery and NURBS residual refinement
+  - NURBS/NURBS surface intersection via tessellated discovery, NURBS residual refinement, and trim-ready 3D/p-curve output
 - Boolean operation:
   - cube minus Z-cylinder as a validated genus-1 half-edge solid
 - Thin parametric feature layer:
@@ -121,15 +121,15 @@ cargo check --features native-viewer --bin native-viewer --locked
 
 The boolean module deliberately supports one hard representative case instead of pretending to solve all solid modeling. The result is a real closed half-edge solid for cube-minus-cylinder with `V - E + F = 0`, which is the expected genus-1 topology.
 
-The intersection module has exact analytic line/plane and plane/plane routines, plus marching/bracketing routines for NURBS cases. The NURBS/NURBS SSI path is a representative curve finder, not a full CAD face-intersection engine: coplanar overlap classification, trim-curve fitting, coincident face merging, and topology healing are the next major layers.
+The intersection module has exact analytic line/plane and plane/plane routines, plus marching/bracketing routines for NURBS cases. The NURBS/NURBS SSI path emits trim-ready `EdgeCurve3D` plus two `TrimCurve2D` p-curves, but it is not yet a full CAD face-intersection engine: coplanar overlap classification, coincident face merging, face splitting, and topology healing are the next major layers.
 
 The predicates are conservative interval filters. When a determinant cannot be certified, the API returns `Uncertain`; it does not silently trust an unstable sign.
 
 ## Roadmap
 
 - Broaden Euler operators beyond the current `MVFS`, `MEV`, and `MEF` construction layer.
-- Add face splitting that turns SSI output into trim loops on analytic faces.
-- Extend NURBS/NURBS SSI with coplanar overlap classification and fitted 3D/p-curve pairs.
+- Add face splitting that installs trim-ready SSI output onto analytic faces.
+- Extend NURBS/NURBS SSI with coplanar overlap classification and higher-order curve fitting.
 - Generalize booleans beyond the representative cube-minus-cylinder case.
 - Add viewer overlays for topology, normals, residuals, and golden-reference inspection.
 

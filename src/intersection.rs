@@ -1,10 +1,11 @@
 //! Curve/surface and surface/surface intersection routines.
 
 use crate::geometry::{Line, Plane};
-use crate::math::{Point3, Vec3};
+use crate::math::{Point3, Vec2, Vec3};
 use crate::nurbs::{NurbsCurve, NurbsSurface};
 use crate::predicates::{Interval, RobustSign};
 use crate::tessellation::tessellate_nurbs_surface;
+use crate::topology::{EdgeCurve3D, TrimCurve2D};
 
 /// Classification for a line-plane intersection.
 #[derive(Clone, Debug, PartialEq)]
@@ -66,6 +67,44 @@ pub struct IntersectionPolyline {
     pub points: Vec<Point3>,
     /// Maximum absolute residual sampled or refined while marching.
     pub max_residual: f64,
+}
+
+/// One refined sample on a surface/surface intersection curve.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SurfaceSurfaceIntersectionPoint {
+    /// Refined model-space point on the intersection.
+    pub point: Point3,
+    /// Parameter on the first surface.
+    pub a_uv: Vec2,
+    /// Parameter on the second surface.
+    pub b_uv: Vec2,
+    /// Distance between the two refined surface evaluations.
+    pub residual: f64,
+}
+
+/// Trim-ready approximation of a NURBS/NURBS surface intersection curve.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrimReadyIntersectionCurve {
+    /// Refined samples in curve order.
+    pub points: Vec<SurfaceSurfaceIntersectionPoint>,
+    /// Model-space curve suitable for a topological `Edge`.
+    pub edge_curve: EdgeCurve3D,
+    /// P-curve on the first surface.
+    pub a_pcurve: TrimCurve2D,
+    /// P-curve on the second surface.
+    pub b_pcurve: TrimCurve2D,
+    /// Maximum refined residual across samples.
+    pub max_residual: f64,
+}
+
+impl TrimReadyIntersectionCurve {
+    /// Convert to the legacy point-only polyline form.
+    pub fn to_polyline(&self) -> IntersectionPolyline {
+        IntersectionPolyline {
+            points: self.points.iter().map(|sample| sample.point).collect(),
+            max_residual: self.max_residual,
+        }
+    }
 }
 
 /// Intersect an infinite line with an infinite plane.
@@ -233,7 +272,8 @@ pub fn intersect_plane_nurbs_surface(
 ///
 /// This is a practical first NURBS/NURBS SSI stage: both surfaces are sampled into
 /// triangle grids, candidate triangle-triangle intersection segments are found,
-/// and segment endpoints are refined against the original parametric surfaces.
+/// segment endpoints are refined against the original parametric surfaces, and
+/// the stitched result carries a 3D edge curve plus one p-curve on each surface.
 /// Coplanar overlap regions are treated as degenerate and are not emitted.
 pub fn intersect_nurbs_surfaces(
     a: &NurbsSurface,
@@ -241,7 +281,7 @@ pub fn intersect_nurbs_surfaces(
     u_steps: usize,
     v_steps: usize,
     tol: f64,
-) -> Vec<IntersectionPolyline> {
+) -> Vec<TrimReadyIntersectionCurve> {
     let tol = tol.max(1.0e-12);
     let stitch_tol = (tol * 64.0).max(1.0e-7);
     let a_triangles = tessellated_surface_triangles(a, u_steps.max(2), v_steps.max(2));
@@ -253,14 +293,14 @@ pub fn intersect_nurbs_surfaces(
             let Some(pair) = triangle_pair_intersection(a_triangle, b_triangle, tol) else {
                 continue;
             };
-            let (p0, r0) = refine_surface_pair(a, b, pair[0], tol);
-            let (p1, r1) = refine_surface_pair(a, b, pair[1], tol);
+            let p0 = refine_surface_pair(a, b, pair[0], tol);
+            let p1 = refine_surface_pair(a, b, pair[1], tol);
             push_unique_segment(
                 &mut raw_segments,
                 RawIntersectionSegment {
                     a: p0,
                     b: p1,
-                    max_residual: r0.max(r1),
+                    max_residual: p0.residual.max(p1.residual),
                 },
                 stitch_tol,
             );
@@ -300,8 +340,8 @@ struct SurfacePairPoint {
 
 #[derive(Clone, Copy, Debug)]
 struct RawIntersectionSegment {
-    a: Point3,
-    b: Point3,
+    a: SurfaceSurfaceIntersectionPoint,
+    b: SurfaceSurfaceIntersectionPoint,
     max_residual: f64,
 }
 
@@ -470,7 +510,7 @@ fn refine_surface_pair(
     b: &NurbsSurface,
     guess: SurfacePairPoint,
     tol: f64,
-) -> (Point3, f64) {
+) -> SurfaceSurfaceIntersectionPoint {
     let ((au0, au1), (av0, av1)) = a.domain();
     let ((bu0, bu1), (bv0, bv1)) = b.domain();
     let mut au = guess.a.u.clamp(au0, au1);
@@ -529,7 +569,13 @@ fn refine_surface_pair(
 
     let pa = a.evaluate(au, av);
     let pb = b.evaluate(bu, bv);
-    ((pa + pb) * 0.5, pa.distance(pb))
+    let residual = pa.distance(pb);
+    SurfaceSurfaceIntersectionPoint {
+        point: (pa + pb) * 0.5,
+        a_uv: Vec2::new(au, av),
+        b_uv: Vec2::new(bu, bv),
+        residual,
+    }
 }
 
 fn solve_gram_3x3(columns: [Vec3; 4], rhs: Vec3, tol: f64) -> Option<Vec3> {
@@ -578,8 +624,8 @@ fn determinant_3x3(matrix: [[f64; 3]; 3]) -> f64 {
 fn stitch_segments(
     segments: Vec<RawIntersectionSegment>,
     stitch_tol: f64,
-) -> Vec<IntersectionPolyline> {
-    let mut vertices = Vec::<Point3>::new();
+) -> Vec<TrimReadyIntersectionCurve> {
+    let mut vertices = Vec::<SurfaceSurfaceIntersectionPoint>::new();
     let mut edges = Vec::<GraphEdge>::new();
     for segment in segments {
         let a = graph_vertex(&mut vertices, segment.a, stitch_tol);
@@ -607,13 +653,13 @@ fn stitch_segments(
     }
 
     let mut visited = vec![false; edges.len()];
-    let mut polylines = Vec::new();
+    let mut curves = Vec::new();
     for start in 0..vertices.len() {
         if adjacency[start].len() == 2 {
             continue;
         }
         while let Some(edge_index) = next_unvisited_edge(start, &adjacency, &visited) {
-            let polyline = walk_polyline(
+            let curve = walk_intersection_curve(
                 start,
                 edge_index,
                 &vertices,
@@ -621,8 +667,8 @@ fn stitch_segments(
                 &adjacency,
                 &mut visited,
             );
-            if polyline.points.len() >= 2 {
-                polylines.push(polyline);
+            if curve.points.len() >= 2 {
+                curves.push(curve);
             }
         }
     }
@@ -632,7 +678,7 @@ fn stitch_segments(
             continue;
         }
         let start = edges[edge_index].a;
-        let polyline = walk_polyline(
+        let curve = walk_intersection_curve(
             start,
             edge_index,
             &vertices,
@@ -640,28 +686,28 @@ fn stitch_segments(
             &adjacency,
             &mut visited,
         );
-        if polyline.points.len() >= 2 {
-            polylines.push(polyline);
+        if curve.points.len() >= 2 {
+            curves.push(curve);
         }
     }
 
-    polylines.sort_by(|a, b| {
+    curves.sort_by(|a, b| {
         b.points
             .len()
             .cmp(&a.points.len())
-            .then_with(|| compare_points(a.points[0], b.points[0]))
+            .then_with(|| compare_points(a.points[0].point, b.points[0].point))
     });
-    polylines
+    curves
 }
 
-fn walk_polyline(
+fn walk_intersection_curve(
     start: usize,
     first_edge: usize,
-    vertices: &[Point3],
+    vertices: &[SurfaceSurfaceIntersectionPoint],
     edges: &[GraphEdge],
     adjacency: &[Vec<usize>],
     visited: &mut [bool],
-) -> IntersectionPolyline {
+) -> TrimReadyIntersectionCurve {
     let mut points = vec![vertices[start]];
     let mut current = start;
     let mut next_edge = Some(first_edge);
@@ -680,10 +726,7 @@ fn walk_polyline(
             break;
         }
     }
-    IntersectionPolyline {
-        points,
-        max_residual,
-    }
+    trim_ready_curve(points, max_residual)
 }
 
 fn next_unvisited_edge(vertex: usize, adjacency: &[Vec<usize>], visited: &[bool]) -> Option<usize> {
@@ -693,11 +736,18 @@ fn next_unvisited_edge(vertex: usize, adjacency: &[Vec<usize>], visited: &[bool]
         .find(|edge_index| !visited[*edge_index])
 }
 
-fn graph_vertex(vertices: &mut Vec<Point3>, point: Point3, tol: f64) -> usize {
+fn graph_vertex(
+    vertices: &mut Vec<SurfaceSurfaceIntersectionPoint>,
+    point: SurfaceSurfaceIntersectionPoint,
+    tol: f64,
+) -> usize {
     if let Some(index) = vertices
         .iter()
-        .position(|existing| existing.distance(point) <= tol)
+        .position(|existing| existing.point.distance(point.point) <= tol)
     {
+        if point.residual < vertices[index].residual {
+            vertices[index] = point;
+        }
         index
     } else {
         vertices.push(point);
@@ -710,16 +760,70 @@ fn push_unique_segment(
     segment: RawIntersectionSegment,
     tol: f64,
 ) {
-    if segment.a.distance(segment.b) <= tol {
+    if segment.a.point.distance(segment.b.point) <= tol {
         return;
     }
     if segments.iter().any(|existing| {
-        (existing.a.distance(segment.a) <= tol && existing.b.distance(segment.b) <= tol)
-            || (existing.a.distance(segment.b) <= tol && existing.b.distance(segment.a) <= tol)
+        (existing.a.point.distance(segment.a.point) <= tol
+            && existing.b.point.distance(segment.b.point) <= tol)
+            || (existing.a.point.distance(segment.b.point) <= tol
+                && existing.b.point.distance(segment.a.point) <= tol)
     }) {
         return;
     }
     segments.push(segment);
+}
+
+fn trim_ready_curve(
+    points: Vec<SurfaceSurfaceIntersectionPoint>,
+    edge_residual: f64,
+) -> TrimReadyIntersectionCurve {
+    let max_residual = points
+        .iter()
+        .fold(edge_residual, |acc, point| acc.max(point.residual));
+    TrimReadyIntersectionCurve {
+        edge_curve: edge_curve_from_samples(&points),
+        a_pcurve: pcurve_from_samples(&points, SurfaceSide::A),
+        b_pcurve: pcurve_from_samples(&points, SurfaceSide::B),
+        points,
+        max_residual,
+    }
+}
+
+fn edge_curve_from_samples(points: &[SurfaceSurfaceIntersectionPoint]) -> EdgeCurve3D {
+    if points.len() == 2 {
+        EdgeCurve3D::line_segment(points[0].point, points[1].point)
+    } else {
+        EdgeCurve3D::Polyline {
+            points: points.iter().map(|sample| sample.point).collect(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum SurfaceSide {
+    A,
+    B,
+}
+
+fn pcurve_from_samples(
+    points: &[SurfaceSurfaceIntersectionPoint],
+    side: SurfaceSide,
+) -> TrimCurve2D {
+    let uv = |point: &SurfaceSurfaceIntersectionPoint| match side {
+        SurfaceSide::A => point.a_uv,
+        SurfaceSide::B => point.b_uv,
+    };
+    if points.len() == 2 {
+        TrimCurve2D::LineSegment {
+            start: uv(&points[0]),
+            end: uv(&points[1]),
+        }
+    } else {
+        TrimCurve2D::Polyline {
+            points: points.iter().map(uv).collect(),
+        }
+    }
 }
 
 fn push_unique_sample(samples: &mut Vec<SurfaceSample>, sample: SurfaceSample, tol: f64) {

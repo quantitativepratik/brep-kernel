@@ -47,7 +47,7 @@ The current filter can certify many cases and explicitly reports uncertainty for
 
 `src/intersection.rs` includes exact analytic intersections for linear primitives and marching/bracketing routines for NURBS cases.
 
-The plane/NURBS-surface routine marches over parameter-space cells and emits short polyline segments. The NURBS/NURBS surface routine takes the next step: it tessellates both parametric surfaces for discovery, intersects candidate triangle pairs, then refines segment endpoints against the original NURBS evaluations with a small Gauss-Newton residual solve. It still intentionally stops before trim-curve fitting, coplanar overlap handling, and topology insertion.
+The plane/NURBS-surface routine marches over parameter-space cells and emits short polyline segments. The NURBS/NURBS surface routine takes the next step: it tessellates both parametric surfaces for discovery, intersects candidate triangle pairs, refines segment endpoints against the original NURBS evaluations with a small Gauss-Newton residual solve, and stitches the result into `TrimReadyIntersectionCurve` values. Each curve carries an `EdgeCurve3D` in model space plus `TrimCurve2D` p-curves on both input surfaces. It still intentionally stops before coplanar overlap handling, face splitting, and topology insertion.
 
 ## Booleans
 
