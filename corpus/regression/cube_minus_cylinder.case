@@ -1,0 +1,8 @@
+# A genus-1 boolean: cube subtract vertical cylinder.
+name=cube_minus_cylinder_64
+type=boolean_cube_minus_cylinder
+size=2.0
+radius=0.45
+segments=64
+expect_euler=0
+expect_genus=1

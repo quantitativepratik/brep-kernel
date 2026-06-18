@@ -1,0 +1,16 @@
+# Golden output format v1.
+version=1
+model=rectangular_box_1_25_2_5_0_75
+mesh_hash=0xe487103ae4c09f31
+vertices=8
+edges=18
+halfedges=36
+faces=12
+shells=1
+triangles=12
+boundary_halfedges=0
+euler=2
+genus=0
+volume=2.343750000000000
+surface_area=11.875000000000000
+tolerance=0.000000001

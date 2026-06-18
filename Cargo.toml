@@ -1,0 +1,43 @@
+[package]
+name = "brep-kernel"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.87"
+description = "A small boundary-representation kernel with robust predicates, NURBS, booleans, and WebGPU/WASM hooks."
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/pratikpatil/brep-kernel"
+homepage = "https://github.com/pratikpatil/brep-kernel"
+documentation = "https://docs.rs/brep-kernel"
+keywords = ["brep", "cad", "nurbs", "geometry", "webgpu"]
+categories = ["graphics", "mathematics", "wasm"]
+exclude = [
+    "/.agents",
+    "/.codex",
+    "/outputs",
+    "/target",
+    "/work",
+]
+
+[dependencies]
+bytemuck = { version = "1.24.0", features = ["derive"], optional = true }
+earcutr = "0.5.0"
+pollster = { version = "0.4.0", optional = true }
+wgpu = { version = "29.0.3", optional = true }
+winit = { version = "0.30.12", optional = true }
+
+[features]
+default = []
+native-viewer = ["dep:bytemuck", "dep:pollster", "dep:wgpu", "dep:winit"]
+
+[lib]
+name = "brep_kernel"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "native-viewer"
+path = "src/bin/native_viewer.rs"
+required-features = ["native-viewer"]
+
+[dev-dependencies]
+proptest = "1"

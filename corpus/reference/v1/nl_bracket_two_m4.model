@@ -1,0 +1,5 @@
+# Reference model format v1.
+version=1
+name=nl_bracket_two_m4
+kind=feature_prompt
+prompt=10mm bracket with two M4 holes

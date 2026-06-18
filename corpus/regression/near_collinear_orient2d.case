@@ -1,0 +1,4 @@
+# A tiny perturbation that should not be trusted by naive determinant sign checks.
+name=near_collinear_orient2d_eps
+type=near_collinear_orient2d
+expect_sign=uncertain

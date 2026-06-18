@@ -1,0 +1,16 @@
+# Golden output format v1.
+version=1
+model=cube_minus_cylinder_64
+mesh_hash=0xd771d5b2a0e4e204
+vertices=256
+edges=768
+halfedges=1536
+faces=512
+shells=1
+triangles=512
+boundary_halfedges=0
+euler=0
+genus=1
+volume=6.729697861328908
+surface_area=28.382293943847387
+tolerance=0.000000001

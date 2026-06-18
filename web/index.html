@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>B-rep Kernel Viewer</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <canvas id="viewport"></canvas>
+      <section class="toolbar" aria-label="Viewer controls">
+        <div class="segmented" role="tablist" aria-label="Render mode">
+          <button id="modePatch" class="active" type="button">GPU NURBS</button>
+          <button id="modeBoolean" type="button">B-rep Boolean</button>
+        </div>
+        <label>
+          <span>Grid</span>
+          <input id="grid" type="range" min="8" max="96" step="4" value="48" />
+        </label>
+        <label>
+          <span>Segments</span>
+          <input id="segments" type="range" min="16" max="128" step="8" value="64" />
+        </label>
+      </section>
+      <section class="readout" aria-live="polite">
+        <div><span id="meshName">GPU NURBS</span></div>
+        <div><span id="stats">initializing</span></div>
+      </section>
+    </main>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

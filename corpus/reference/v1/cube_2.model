@@ -1,0 +1,5 @@
+# Reference model format v1.
+version=1
+name=cube_2
+kind=cube
+size=2.0

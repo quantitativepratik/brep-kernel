@@ -1,0 +1,22 @@
+name: Feature request
+description: Propose a modeling, geometry, robustness, or viewer feature.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What should the kernel be able to do?
+    validations:
+      required: true
+  - type: textarea
+    id: approach
+    attributes:
+      label: Possible approach
+      description: Include relevant papers, algorithms, CAD-kernel behavior, or test cases.
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: What tests or examples would prove this works?

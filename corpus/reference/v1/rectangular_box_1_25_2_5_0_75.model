@@ -1,0 +1,5 @@
+# Reference model format v1.
+version=1
+name=rectangular_box_1_25_2_5_0_75
+kind=box
+size=1.25,2.5,0.75

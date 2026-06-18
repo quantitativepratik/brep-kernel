@@ -1,0 +1,7 @@
+# Reference model format v1.
+version=1
+name=cube_minus_cylinder_64
+kind=cube_minus_cylinder
+cube_size=2.0
+radius=0.45
+segments=64

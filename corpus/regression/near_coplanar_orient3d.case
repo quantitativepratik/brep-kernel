@@ -1,0 +1,4 @@
+# Coplanar tetrahedron that must not be assigned an arbitrary side.
+name=coplanar_orient3d_zero_volume
+type=near_coplanar_orient3d
+expect_sign=uncertain

@@ -1,0 +1,16 @@
+# Golden output format v1.
+version=1
+model=nl_bracket_two_m4
+mesh_hash=0xc110efbbb08c846a
+vertices=136
+edges=414
+halfedges=828
+faces=276
+shells=1
+triangles=276
+boundary_halfedges=0
+euler=-2
+genus=2
+volume=15883.953678333866264
+surface_area=5349.080099815868380
+tolerance=0.000000001

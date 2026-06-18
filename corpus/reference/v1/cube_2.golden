@@ -1,0 +1,16 @@
+# Golden output format v1.
+version=1
+model=cube_2
+mesh_hash=0x3596e2df4d759601
+vertices=8
+edges=18
+halfedges=36
+faces=12
+shells=1
+triangles=12
+boundary_halfedges=0
+euler=2
+genus=0
+volume=8.000000000000000
+surface_area=24.000000000000000
+tolerance=0.000000001
