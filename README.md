@@ -30,6 +30,7 @@ Then open `http://localhost:8080/web/`.
 ## What Is Implemented
 
 - Half-edge topology for closed manifold triangle B-reps: vertices, half-edges, edges, faces, shells, solids, Euler/genus validation, signed volume.
+- Analytic face support and trim-loop topology: `FaceSurface` for planes, cylinders, and NURBS surfaces; outer/inner `TrimLoop`s with 2D p-curves.
 - Euler construction operators: `MVFS`, `MEV`, and `MEF`, with count invariants and conversion into validated half-edge solids.
 - Analytic primitives: lines, planes, circles, boxes, cylinders.
 - NURBS curves and surfaces: clamped/nonuniform knot vectors, rational evaluation, first derivatives, surface normals, curve knot insertion.
@@ -127,7 +128,7 @@ The predicates are conservative interval filters. When a determinant cannot be c
 ## Roadmap
 
 - Broaden Euler operators beyond the current `MVFS`, `MEV`, and `MEF` construction layer.
-- Add trim-loop aware analytic faces instead of only faceted final solids.
+- Add face splitting that turns SSI output into trim loops on analytic faces.
 - Extend NURBS/NURBS SSI with coplanar overlap classification and fitted trim curves.
 - Generalize booleans beyond the representative cube-minus-cylinder case.
 - Add viewer overlays for topology, normals, residuals, and golden-reference inspection.

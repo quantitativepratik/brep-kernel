@@ -15,7 +15,9 @@ The kernel is arranged around a small set of boundaries.
 
 The constructor builds twin adjacency from indexed triangles and rejects boundary, duplicate, and nonmanifold directed edges. The validator checks `next`, `prev`, and `twin` consistency. Euler characteristic and genus are derived from the resulting graph.
 
-The current face geometry tag supports planar/faceted faces. A larger kernel would add analytic support surfaces, trim loops, coedges, and per-face tolerance metadata.
+Faces now carry an analytic `FaceSurface` support tag and ordered trim loops. Supported face surfaces are planes, Z-aligned cylinders, NURBS surfaces, and faceted fallbacks. Each `TrimLoop` is either outer or inner, contains ordered trims, and can carry a 2D p-curve in the face parameter domain. Triangle-mesh construction automatically gives every face one projected outer trim loop when the face can be classified as planar.
+
+This is a topology representation layer, not yet a full trimming engine. The next layers are face splitting, fitted trim-curve creation from SSI output, coedge-level tolerance metadata, and healing/sewing.
 
 `src/euler.rs` provides the constructive Euler-operator layer above this final topology:
 

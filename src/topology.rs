@@ -1,7 +1,8 @@
 //! Half-edge topology for closed manifold B-reps.
 
-use crate::geometry::Plane;
-use crate::math::{Point3, Vec3};
+use crate::geometry::{Cylinder, Plane};
+use crate::math::{Point3, Vec2, Vec3};
+use crate::nurbs::NurbsSurface;
 use std::collections::HashMap;
 
 /// Vertex identifier.
@@ -46,13 +47,187 @@ pub struct Edge {
     pub halfedge: HalfEdgeId,
 }
 
-/// Face geometry tag.
+/// Analytic support surface for a face.
 #[derive(Clone, Debug, PartialEq)]
-pub enum FaceGeometry {
+pub enum FaceSurface {
     /// Planar face.
     Plane(Plane),
-    /// Faceted or not yet classified.
+    /// Z-aligned cylindrical face.
+    Cylinder(Cylinder),
+    /// NURBS support surface.
+    Nurbs(Box<NurbsSurface>),
+    /// Faceted or not yet analytically classified.
     Faceted,
+}
+
+impl FaceSurface {
+    /// Project a model-space point into the surface parameter domain when a direct projection exists.
+    ///
+    /// Planes use a deterministic orthonormal frame. Cylinders use `(angle, height)`
+    /// around the Z-aligned cylinder. NURBS inverse evaluation is deliberately not
+    /// hidden here, so this returns `None` for NURBS surfaces.
+    pub fn project_point(&self, point: Point3) -> Option<Vec2> {
+        match self {
+            Self::Plane(plane) => {
+                let (u_axis, v_axis) = plane_frame(*plane);
+                let d = point - plane.origin;
+                Some(Vec2::new(d.dot(u_axis), d.dot(v_axis)))
+            }
+            Self::Cylinder(cylinder) => {
+                let d = point - cylinder.center;
+                Some(Vec2::new(d.y.atan2(d.x), d.z))
+            }
+            Self::Nurbs(_) | Self::Faceted => None,
+        }
+    }
+}
+
+/// Backward-compatible name for the face support surface tag.
+pub type FaceGeometry = FaceSurface;
+
+/// Role of a trim loop on a face.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrimLoopKind {
+    /// Boundary of the visible face region.
+    Outer,
+    /// Hole or island-excluding loop inside the outer boundary.
+    Inner,
+}
+
+/// Two-dimensional curve in a face's parameter domain.
+#[derive(Clone, Debug, PartialEq)]
+pub enum TrimCurve2D {
+    /// Straight p-curve segment from `start` to `end`.
+    LineSegment {
+        /// Start point in `(u, v)`.
+        start: Vec2,
+        /// End point in `(u, v)`.
+        end: Vec2,
+    },
+    /// Circular p-curve arc.
+    CircularArc {
+        /// Arc center in `(u, v)`.
+        center: Vec2,
+        /// Arc radius.
+        radius: f64,
+        /// Start angle in radians.
+        start_angle: f64,
+        /// End angle in radians.
+        end_angle: f64,
+    },
+    /// Piecewise-linear p-curve.
+    Polyline {
+        /// Ordered polyline points.
+        points: Vec<Vec2>,
+    },
+    /// Topological trim exists, but the p-curve has not been fitted or projected yet.
+    Unresolved,
+}
+
+impl TrimCurve2D {
+    /// Return start and end points if the p-curve has explicit endpoints.
+    pub fn endpoints(&self) -> Option<(Vec2, Vec2)> {
+        match self {
+            Self::LineSegment { start, end } => Some((*start, *end)),
+            Self::CircularArc {
+                center,
+                radius,
+                start_angle,
+                end_angle,
+            } => Some((
+                *center + Vec2::new(start_angle.cos() * *radius, start_angle.sin() * *radius),
+                *center + Vec2::new(end_angle.cos() * *radius, end_angle.sin() * *radius),
+            )),
+            Self::Polyline { points } => Some((*points.first()?, *points.last()?)),
+            Self::Unresolved => None,
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        match self {
+            Self::LineSegment { start, end } => finite_vec2(*start) && finite_vec2(*end),
+            Self::CircularArc {
+                center,
+                radius,
+                start_angle,
+                end_angle,
+            } => {
+                finite_vec2(*center)
+                    && radius.is_finite()
+                    && *radius > 0.0
+                    && start_angle.is_finite()
+                    && end_angle.is_finite()
+            }
+            Self::Polyline { points } => {
+                points.len() >= 2 && points.iter().all(|point| finite_vec2(*point))
+            }
+            Self::Unresolved => true,
+        }
+    }
+}
+
+/// One oriented trim edge on a face boundary.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Trim {
+    /// Optional topological half-edge represented by this trim.
+    pub halfedge: Option<HalfEdgeId>,
+    /// P-curve in the face parameter domain.
+    pub curve: TrimCurve2D,
+    /// Geometric tolerance for endpoint matching and later classification.
+    pub tolerance: f64,
+}
+
+impl Trim {
+    /// Construct an unresolved trim attached to a half-edge.
+    pub fn unresolved(halfedge: HalfEdgeId) -> Self {
+        Self {
+            halfedge: Some(halfedge),
+            curve: TrimCurve2D::Unresolved,
+            tolerance: DEFAULT_TRIM_TOLERANCE,
+        }
+    }
+
+    /// Construct an analytic trim curve that is not tied to an existing half-edge.
+    pub fn curve(curve: TrimCurve2D, tolerance: f64) -> Self {
+        Self {
+            halfedge: None,
+            curve,
+            tolerance,
+        }
+    }
+
+    /// Construct a line-segment p-curve attached to a half-edge.
+    pub fn line_segment(halfedge: HalfEdgeId, start: Vec2, end: Vec2, tolerance: f64) -> Self {
+        Self {
+            halfedge: Some(halfedge),
+            curve: TrimCurve2D::LineSegment { start, end },
+            tolerance,
+        }
+    }
+}
+
+/// Ordered trim loop bounding a face region.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrimLoop {
+    /// Outer or inner loop role.
+    pub kind: TrimLoopKind,
+    /// Ordered trim edges.
+    pub trims: Vec<Trim>,
+}
+
+impl TrimLoop {
+    /// Construct a trim loop from explicit trims.
+    pub fn new(kind: TrimLoopKind, trims: Vec<Trim>) -> Self {
+        Self { kind, trims }
+    }
+
+    /// Construct a topological loop from ordered half-edges.
+    pub fn from_halfedges(kind: TrimLoopKind, halfedges: Vec<HalfEdgeId>) -> Self {
+        Self {
+            kind,
+            trims: halfedges.into_iter().map(Trim::unresolved).collect(),
+        }
+    }
 }
 
 /// Topological face.
@@ -60,8 +235,10 @@ pub enum FaceGeometry {
 pub struct Face {
     /// One half-edge on the outer loop.
     pub halfedge: HalfEdgeId,
-    /// Geometric support.
-    pub geometry: FaceGeometry,
+    /// Analytic support surface.
+    pub surface: FaceSurface,
+    /// Ordered outer and inner trim loops on the face.
+    pub trim_loops: Vec<TrimLoop>,
 }
 
 /// Connected boundary shell.
@@ -118,6 +295,18 @@ pub enum TopologyError {
     BoundaryEdge(VertexId, VertexId),
     /// Half-edge links are inconsistent.
     BrokenHalfEdge(HalfEdgeId),
+    /// A face id does not exist.
+    InvalidFace(FaceId),
+    /// A face is missing exactly one outer trim loop.
+    MissingOuterTrimLoop(FaceId),
+    /// A trim loop is malformed.
+    InvalidTrimLoop(FaceId, usize),
+    /// A trim references a missing or wrong-face half-edge.
+    InvalidTrimHalfEdge(FaceId, HalfEdgeId),
+    /// A trim p-curve is malformed.
+    InvalidTrimCurve(FaceId, usize, usize),
+    /// Consecutive p-curves do not close within tolerance.
+    OpenTrimLoop(FaceId, usize),
 }
 
 impl Solid {
@@ -162,7 +351,11 @@ impl Solid {
             }
             faces.push(Face {
                 halfedge: base,
-                geometry: FaceGeometry::Faceted,
+                surface: FaceSurface::Faceted,
+                trim_loops: vec![TrimLoop::from_halfedges(
+                    TrimLoopKind::Outer,
+                    vec![base, base + 1, base + 2],
+                )],
             });
         }
 
@@ -252,7 +445,75 @@ impl Solid {
                 return Err(TopologyError::BrokenHalfEdge(id));
             }
         }
+        self.validate_trim_topology()?;
         Ok(())
+    }
+
+    /// Validate per-face support surfaces and trim-loop topology.
+    pub fn validate_trim_topology(&self) -> Result<(), TopologyError> {
+        for (face_id, face) in self.faces.iter().enumerate() {
+            if face.halfedge >= self.halfedges.len()
+                || self.halfedges[face.halfedge].face != face_id
+            {
+                return Err(TopologyError::BrokenHalfEdge(face.halfedge));
+            }
+            let outer_count = face
+                .trim_loops
+                .iter()
+                .filter(|trim_loop| trim_loop.kind == TrimLoopKind::Outer)
+                .count();
+            if outer_count != 1 {
+                return Err(TopologyError::MissingOuterTrimLoop(face_id));
+            }
+            for (loop_index, trim_loop) in face.trim_loops.iter().enumerate() {
+                self.validate_trim_loop(face_id, loop_index, trim_loop)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Replace a face's analytic support surface and rebuild direct p-curves when possible.
+    pub fn set_face_surface(
+        &mut self,
+        face: FaceId,
+        surface: FaceSurface,
+    ) -> Result<(), TopologyError> {
+        if face >= self.faces.len() {
+            return Err(TopologyError::InvalidFace(face));
+        }
+        self.faces[face].surface = surface;
+        self.rebuild_face_trim_curves(face);
+        self.validate_trim_topology()
+    }
+
+    /// Replace a face's trim loops.
+    pub fn set_face_trim_loops(
+        &mut self,
+        face: FaceId,
+        trim_loops: Vec<TrimLoop>,
+    ) -> Result<(), TopologyError> {
+        if face >= self.faces.len() {
+            return Err(TopologyError::InvalidFace(face));
+        }
+        let old = core::mem::replace(&mut self.faces[face].trim_loops, trim_loops);
+        if let Err(error) = self.validate_trim_topology() {
+            self.faces[face].trim_loops = old;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Count trim loops by `(outer, inner)` role.
+    pub fn trim_loop_counts(&self) -> (usize, usize) {
+        let mut outer = 0;
+        let mut inner = 0;
+        for trim_loop in self.faces.iter().flat_map(|face| &face.trim_loops) {
+            match trim_loop.kind {
+                TrimLoopKind::Outer => outer += 1,
+                TrimLoopKind::Inner => inner += 1,
+            }
+        }
+        (outer, inner)
     }
 
     /// Euler characteristic `V - E + F`.
@@ -362,6 +623,59 @@ impl Solid {
         self.halfedges.iter().filter(|he| he.twin.is_none()).count()
     }
 
+    fn validate_trim_loop(
+        &self,
+        face_id: FaceId,
+        loop_index: usize,
+        trim_loop: &TrimLoop,
+    ) -> Result<(), TopologyError> {
+        if trim_loop.trims.is_empty() {
+            return Err(TopologyError::InvalidTrimLoop(face_id, loop_index));
+        }
+        for (trim_index, trim) in trim_loop.trims.iter().enumerate() {
+            if !trim.tolerance.is_finite() || trim.tolerance < 0.0 {
+                return Err(TopologyError::InvalidTrimCurve(
+                    face_id, loop_index, trim_index,
+                ));
+            }
+            if !trim.curve.is_valid() {
+                return Err(TopologyError::InvalidTrimCurve(
+                    face_id, loop_index, trim_index,
+                ));
+            }
+            if let Some(halfedge) = trim.halfedge {
+                if halfedge >= self.halfedges.len() || self.halfedges[halfedge].face != face_id {
+                    return Err(TopologyError::InvalidTrimHalfEdge(face_id, halfedge));
+                }
+                let next_trim = &trim_loop.trims[(trim_index + 1) % trim_loop.trims.len()];
+                if let Some(next_halfedge) = next_trim.halfedge {
+                    if self.halfedges[halfedge].next != next_halfedge {
+                        return Err(TopologyError::InvalidTrimLoop(face_id, loop_index));
+                    }
+                }
+            }
+        }
+
+        for trim_index in 0..trim_loop.trims.len() {
+            let trim = &trim_loop.trims[trim_index];
+            let next_trim = &trim_loop.trims[(trim_index + 1) % trim_loop.trims.len()];
+            let Some((_, end)) = trim.curve.endpoints() else {
+                continue;
+            };
+            let Some((next_start, _)) = next_trim.curve.endpoints() else {
+                continue;
+            };
+            let tolerance = trim
+                .tolerance
+                .max(next_trim.tolerance)
+                .max(DEFAULT_TRIM_TOLERANCE);
+            if vec2_distance(end, next_start) > tolerance {
+                return Err(TopologyError::OpenTrimLoop(face_id, loop_index));
+            }
+        }
+        Ok(())
+    }
+
     fn classify_planar_faces(&mut self) {
         for face_id in 0..self.faces.len() {
             let tri = self.face_vertices(face_id);
@@ -369,7 +683,29 @@ impl Solid {
             let b = self.vertices[tri[1]].point;
             let c = self.vertices[tri[2]].point;
             if let Some(plane) = Plane::from_points(a, b, c) {
-                self.faces[face_id].geometry = FaceGeometry::Plane(plane);
+                self.faces[face_id].surface = FaceSurface::Plane(plane);
+                self.rebuild_face_trim_curves(face_id);
+            }
+        }
+    }
+
+    fn rebuild_face_trim_curves(&mut self, face_id: FaceId) {
+        let surface = self.faces[face_id].surface.clone();
+        for trim_loop in &mut self.faces[face_id].trim_loops {
+            for trim in &mut trim_loop.trims {
+                let Some(halfedge) = trim.halfedge else {
+                    continue;
+                };
+                let start = self.vertices[self.halfedges[halfedge].origin].point;
+                let end = self.vertices[self.halfedges[self.halfedges[halfedge].next].origin].point;
+                trim.curve = if let (Some(start), Some(end)) =
+                    (surface.project_point(start), surface.project_point(end))
+                {
+                    TrimCurve2D::LineSegment { start, end }
+                } else {
+                    TrimCurve2D::Unresolved
+                };
+                trim.tolerance = DEFAULT_TRIM_TOLERANCE;
             }
         }
     }
@@ -383,9 +719,31 @@ pub fn triangle_normal(points: &[Point3], tri: [usize; 3]) -> Vec3 {
     (b - a).cross(c - a).normalized()
 }
 
+const DEFAULT_TRIM_TOLERANCE: f64 = 1.0e-9;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const HASH_GRID: f64 = 1_000_000_000.0;
+
+fn plane_frame(plane: Plane) -> (Vec3, Vec3) {
+    let helper = if plane.normal.x.abs() < 0.9 {
+        Vec3::new(1.0, 0.0, 0.0)
+    } else {
+        Vec3::new(0.0, 1.0, 0.0)
+    };
+    let u = plane.normal.cross(helper).normalized();
+    let v = plane.normal.cross(u).normalized();
+    (u, v)
+}
+
+fn finite_vec2(value: Vec2) -> bool {
+    value.x.is_finite() && value.y.is_finite()
+}
+
+fn vec2_distance(a: Vec2, b: Vec2) -> f64 {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    (dx * dx + dy * dy).sqrt()
+}
 
 fn hash_u64(mut hash: u64, value: u64) -> u64 {
     for byte in value.to_le_bytes() {

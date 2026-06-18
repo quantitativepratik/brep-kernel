@@ -5,6 +5,7 @@
 Initial public prototype:
 
 - half-edge topology and Euler construction operators
+- analytic face support and trim-loop topology
 - NURBS curve/surface evaluation and derivatives
 - interval-filtered robust predicates
 - representative curve/surface and surface/surface intersections
