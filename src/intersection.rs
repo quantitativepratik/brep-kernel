@@ -5,7 +5,7 @@ use crate::math::{Point3, Vec2, Vec3};
 use crate::nurbs::{NurbsCurve, NurbsSurface};
 use crate::predicates::{Interval, RobustSign};
 use crate::tessellation::tessellate_nurbs_surface;
-use crate::topology::{EdgeCurve3D, TrimCurve2D};
+use crate::topology::{EdgeCurve3D, FaceId, Solid, SplitFacesReport, TopologyError, TrimCurve2D};
 
 /// Classification for a line-plane intersection.
 #[derive(Clone, Debug, PartialEq)]
@@ -104,6 +104,24 @@ impl TrimReadyIntersectionCurve {
             points: self.points.iter().map(|sample| sample.point).collect(),
             max_residual: self.max_residual,
         }
+    }
+
+    /// Install this trim-ready SSI curve as a staged split between two faces.
+    pub fn split_faces(
+        &self,
+        solid: &mut Solid,
+        a_face: FaceId,
+        b_face: FaceId,
+        tolerance: f64,
+    ) -> Result<SplitFacesReport, TopologyError> {
+        solid.split_faces_with_curves(
+            a_face,
+            b_face,
+            self.edge_curve.clone(),
+            self.a_pcurve.clone(),
+            self.b_pcurve.clone(),
+            tolerance,
+        )
     }
 }
 

@@ -13,6 +13,8 @@ pub type HalfEdgeId = usize;
 pub type EdgeId = usize;
 /// Face identifier.
 pub type FaceId = usize;
+/// Split-edge identifier for staged face-splitting wires.
+pub type SplitEdgeId = usize;
 
 /// A topological vertex with geometric position.
 #[derive(Clone, Debug, PartialEq)]
@@ -48,6 +50,23 @@ pub struct Edge {
     /// Model-space curve supporting this edge.
     pub curve: EdgeCurve3D,
     /// Geometric tolerance for endpoint checks and later edge classification.
+    pub tolerance: f64,
+}
+
+/// Shared model-space curve produced by a face split.
+///
+/// Split edges are deliberately staged outside the closed shell half-edge graph.
+/// They carry the 3D intersection/split curve and are referenced by face-local
+/// p-curves until a later healing step rewrites the affected trim loops.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SplitEdge {
+    /// Model-space curve supporting the split.
+    pub curve: EdgeCurve3D,
+    /// Start point in model space.
+    pub start: Point3,
+    /// End point in model space.
+    pub end: Point3,
+    /// Geometric tolerance for endpoint matching and later classification.
     pub tolerance: f64,
 }
 
@@ -330,6 +349,21 @@ impl TrimLoop {
     }
 }
 
+/// One face-local use of a staged split edge.
+///
+/// The `pcurve` is the same model-space split curve expressed in this face's
+/// parameter domain. A robust Boolean pipeline can use these records as the
+/// input to region classification and trim-loop healing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FaceSplit {
+    /// Shared model-space split edge.
+    pub split_edge: SplitEdgeId,
+    /// Face parameter-space curve for this split.
+    pub pcurve: TrimCurve2D,
+    /// Geometric tolerance for endpoint matching and later classification.
+    pub tolerance: f64,
+}
+
 /// Topological face.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Face {
@@ -339,6 +373,8 @@ pub struct Face {
     pub surface: FaceSurface,
     /// Ordered outer and inner trim loops on the face.
     pub trim_loops: Vec<TrimLoop>,
+    /// Staged split curves installed on this face before trim-loop healing.
+    pub split_curves: Vec<FaceSplit>,
 }
 
 /// Connected boundary shell.
@@ -357,6 +393,8 @@ pub struct Solid {
     pub halfedges: Vec<HalfEdge>,
     /// Undirected edges.
     pub edges: Vec<Edge>,
+    /// Staged split edges that are not yet part of the closed shell graph.
+    pub split_edges: Vec<SplitEdge>,
     /// Faces.
     pub faces: Vec<Face>,
     /// Shells.
@@ -382,6 +420,21 @@ pub struct TopologyCounts {
     pub boundary_halfedges: usize,
 }
 
+/// Result of installing one split curve on two faces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SplitFacesReport {
+    /// Shared staged split edge.
+    pub split_edge: SplitEdgeId,
+    /// First face receiving the split.
+    pub a_face: FaceId,
+    /// Second face receiving the split.
+    pub b_face: FaceId,
+    /// Index into `a_face.split_curves`.
+    pub a_split: usize,
+    /// Index into `b_face.split_curves`.
+    pub b_split: usize,
+}
+
 /// Topology construction or validation error.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TopologyError {
@@ -403,6 +456,16 @@ pub enum TopologyError {
     EdgeCurveEndpointMismatch(EdgeId),
     /// A face id does not exist.
     InvalidFace(FaceId),
+    /// A face split has no usable span or cannot be represented by this operation.
+    DegenerateFaceSplit(FaceId),
+    /// A split-edge id does not exist.
+    InvalidSplitEdge(SplitEdgeId),
+    /// A split-edge model-space curve is malformed.
+    InvalidSplitCurve(SplitEdgeId),
+    /// A split-edge curve's endpoints do not match the stored split endpoints.
+    SplitCurveEndpointMismatch(SplitEdgeId),
+    /// A face-local split-curve use is malformed.
+    InvalidFaceSplit(FaceId, usize),
     /// A face is missing exactly one outer trim loop.
     MissingOuterTrimLoop(FaceId),
     /// A trim loop is malformed.
@@ -462,6 +525,7 @@ impl Solid {
                     TrimLoopKind::Outer,
                     vec![base, base + 1, base + 2],
                 )],
+                split_curves: Vec::new(),
             });
         }
 
@@ -503,6 +567,7 @@ impl Solid {
             vertices,
             halfedges,
             edges,
+            split_edges: Vec::new(),
             faces,
             shells: vec![Shell {
                 faces: (0..triangles.len()).collect(),
@@ -559,6 +624,7 @@ impl Solid {
         }
         self.validate_edge_curves()?;
         self.validate_trim_topology()?;
+        self.validate_face_splits()?;
         Ok(())
     }
 
@@ -609,6 +675,57 @@ impl Solid {
             }
             for (loop_index, trim_loop) in face.trim_loops.iter().enumerate() {
                 self.validate_trim_loop(face_id, loop_index, trim_loop)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate staged split edges and their face-local p-curves.
+    pub fn validate_face_splits(&self) -> Result<(), TopologyError> {
+        for (split_edge_id, split_edge) in self.split_edges.iter().enumerate() {
+            if !split_edge.tolerance.is_finite()
+                || split_edge.tolerance < 0.0
+                || !finite_point3(split_edge.start)
+                || !finite_point3(split_edge.end)
+                || !split_edge.curve.is_valid()
+            {
+                return Err(TopologyError::InvalidSplitCurve(split_edge_id));
+            }
+            let Some((curve_start, curve_end)) = split_edge.curve.endpoints() else {
+                return Err(TopologyError::InvalidSplitCurve(split_edge_id));
+            };
+            let tolerance = split_edge.tolerance.max(DEFAULT_EDGE_TOLERANCE);
+            if !edge_curve_has_span(&split_edge.curve, tolerance) {
+                return Err(TopologyError::InvalidSplitCurve(split_edge_id));
+            }
+            let forward = curve_start.distance(split_edge.start) <= tolerance
+                && curve_end.distance(split_edge.end) <= tolerance;
+            let reverse = curve_start.distance(split_edge.end) <= tolerance
+                && curve_end.distance(split_edge.start) <= tolerance;
+            if !forward && !reverse {
+                return Err(TopologyError::SplitCurveEndpointMismatch(split_edge_id));
+            }
+        }
+
+        let mut uses = vec![Vec::<FaceId>::new(); self.split_edges.len()];
+        for (face_id, face) in self.faces.iter().enumerate() {
+            for (split_index, split) in face.split_curves.iter().enumerate() {
+                if split.split_edge >= self.split_edges.len() {
+                    return Err(TopologyError::InvalidSplitEdge(split.split_edge));
+                }
+                if !split.tolerance.is_finite()
+                    || split.tolerance < 0.0
+                    || !split.pcurve.is_valid()
+                    || split.pcurve.endpoints().is_none()
+                {
+                    return Err(TopologyError::InvalidFaceSplit(face_id, split_index));
+                }
+                uses[split.split_edge].push(face_id);
+            }
+        }
+        for (split_edge_id, faces) in uses.iter().enumerate() {
+            if faces.len() != 2 || faces[0] == faces[1] {
+                return Err(TopologyError::InvalidSplitEdge(split_edge_id));
             }
         }
         Ok(())
@@ -699,6 +816,88 @@ impl Solid {
         Ok(())
     }
 
+    /// Install a trim-ready split curve on two faces.
+    ///
+    /// This operation is the topological staging point after SSI and before
+    /// Boolean region classification. It records a shared 3D split edge plus
+    /// one p-curve per face, while leaving the closed shell half-edge graph and
+    /// Euler counts unchanged.
+    pub fn split_faces_with_curves(
+        &mut self,
+        a_face: FaceId,
+        b_face: FaceId,
+        edge_curve: EdgeCurve3D,
+        a_pcurve: TrimCurve2D,
+        b_pcurve: TrimCurve2D,
+        tolerance: f64,
+    ) -> Result<SplitFacesReport, TopologyError> {
+        if a_face >= self.faces.len() {
+            return Err(TopologyError::InvalidFace(a_face));
+        }
+        if b_face >= self.faces.len() {
+            return Err(TopologyError::InvalidFace(b_face));
+        }
+        if a_face == b_face {
+            return Err(TopologyError::DegenerateFaceSplit(a_face));
+        }
+        if !tolerance.is_finite() || tolerance < 0.0 || !edge_curve.is_valid() {
+            return Err(TopologyError::InvalidSplitCurve(self.split_edges.len()));
+        }
+        let Some((start, end)) = edge_curve.endpoints() else {
+            return Err(TopologyError::InvalidSplitCurve(self.split_edges.len()));
+        };
+        if !edge_curve_has_span(&edge_curve, tolerance.max(DEFAULT_EDGE_TOLERANCE)) {
+            return Err(TopologyError::DegenerateFaceSplit(a_face));
+        }
+        if !a_pcurve.is_valid() || a_pcurve.endpoints().is_none() {
+            return Err(TopologyError::InvalidFaceSplit(
+                a_face,
+                self.faces[a_face].split_curves.len(),
+            ));
+        }
+        if !b_pcurve.is_valid() || b_pcurve.endpoints().is_none() {
+            return Err(TopologyError::InvalidFaceSplit(
+                b_face,
+                self.faces[b_face].split_curves.len(),
+            ));
+        }
+
+        let split_edge = self.split_edges.len();
+        let a_split = self.faces[a_face].split_curves.len();
+        let b_split = self.faces[b_face].split_curves.len();
+        self.split_edges.push(SplitEdge {
+            curve: edge_curve,
+            start,
+            end,
+            tolerance,
+        });
+        self.faces[a_face].split_curves.push(FaceSplit {
+            split_edge,
+            pcurve: a_pcurve,
+            tolerance,
+        });
+        self.faces[b_face].split_curves.push(FaceSplit {
+            split_edge,
+            pcurve: b_pcurve,
+            tolerance,
+        });
+
+        if let Err(error) = self.validate_face_splits() {
+            self.faces[b_face].split_curves.pop();
+            self.faces[a_face].split_curves.pop();
+            self.split_edges.pop();
+            return Err(error);
+        }
+
+        Ok(SplitFacesReport {
+            split_edge,
+            a_face,
+            b_face,
+            a_split,
+            b_split,
+        })
+    }
+
     /// Return the model-space endpoint vertex ids for an edge.
     pub fn edge_vertices(&self, edge: EdgeId) -> Option<(VertexId, VertexId)> {
         let halfedge = self.edges.get(edge)?.halfedge;
@@ -749,6 +948,11 @@ impl Solid {
             }
         }
         (outer, inner)
+    }
+
+    /// Count staged face-split uses across all faces.
+    pub fn face_split_count(&self) -> usize {
+        self.faces.iter().map(|face| face.split_curves.len()).sum()
     }
 
     /// Euler characteristic `V - E + F`.
@@ -989,6 +1193,32 @@ fn finite_vec2(value: Vec2) -> bool {
 
 fn finite_point3(value: Point3) -> bool {
     value.x.is_finite() && value.y.is_finite() && value.z.is_finite()
+}
+
+fn edge_curve_has_span(curve: &EdgeCurve3D, tolerance: f64) -> bool {
+    match curve {
+        EdgeCurve3D::LineSegment { start, end } => start.distance(*end) > tolerance,
+        EdgeCurve3D::CircularArc {
+            radius,
+            start_angle,
+            end_angle,
+            ..
+        } => *radius > tolerance && (end_angle - start_angle).abs() > tolerance,
+        EdgeCurve3D::Nurbs(curve) => {
+            let (u0, u1) = curve.domain();
+            if (u1 - u0).abs() <= f64::EPSILON {
+                return false;
+            }
+            let start = curve.evaluate(u0);
+            let middle = curve.evaluate((u0 + u1) * 0.5);
+            let end = curve.evaluate(u1);
+            start.distance(middle) > tolerance || start.distance(end) > tolerance
+        }
+        EdgeCurve3D::Polyline { points } => points
+            .windows(2)
+            .any(|edge| edge[0].distance(edge[1]) > tolerance),
+        EdgeCurve3D::Unresolved => false,
+    }
 }
 
 fn vec2_distance(a: Vec2, b: Vec2) -> f64 {

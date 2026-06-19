@@ -19,7 +19,7 @@ Edges now carry an `EdgeCurve3D` support curve in model space. Supported edge cu
 
 Faces carry an analytic `FaceSurface` support tag and ordered trim loops. Supported face surfaces are planes, Z-aligned cylinders, NURBS surfaces, and faceted fallbacks. Each `TrimLoop` is either outer or inner, contains ordered trims, and each trim can carry a 2D p-curve in that face's parameter domain. A single topological edge can therefore have one 3D curve and two distinct p-curves, one for each adjacent face. Triangle-mesh construction automatically gives every edge a 3D line segment and every planar face one projected outer trim loop.
 
-This is a topology representation layer, not yet a full trimming engine. The next layers are face splitting, fitted trim-curve creation from SSI output, coedge-level tolerance metadata, and healing/sewing.
+The topology layer also has a staged face-splitting representation: a `SplitEdge` stores the shared 3D split curve outside the closed shell graph, and each participating face records a `FaceSplit` p-curve in its parameter domain. This lets SSI output be installed for later Boolean classification without corrupting the shell's Euler characteristic. The next layers are promoting those staged splits into healed trim loops, coedge-level tolerance metadata, and sewing/rewriting the affected shell topology.
 
 `src/euler.rs` provides the constructive Euler-operator layer above this final topology:
 
@@ -47,7 +47,7 @@ The current filter can certify many cases and explicitly reports uncertainty for
 
 `src/intersection.rs` includes exact analytic intersections for linear primitives and marching/bracketing routines for NURBS cases.
 
-The plane/NURBS-surface routine marches over parameter-space cells and emits short polyline segments. The NURBS/NURBS surface routine takes the next step: it tessellates both parametric surfaces for discovery, intersects candidate triangle pairs, refines segment endpoints against the original NURBS evaluations with a small Gauss-Newton residual solve, and stitches the result into `TrimReadyIntersectionCurve` values. Each curve carries an `EdgeCurve3D` in model space plus `TrimCurve2D` p-curves on both input surfaces. It still intentionally stops before coplanar overlap handling, face splitting, and topology insertion.
+The plane/NURBS-surface routine marches over parameter-space cells and emits short polyline segments. The NURBS/NURBS surface routine takes the next step: it tessellates both parametric surfaces for discovery, intersects candidate triangle pairs, refines segment endpoints against the original NURBS evaluations with a small Gauss-Newton residual solve, and stitches the result into `TrimReadyIntersectionCurve` values. Each curve carries an `EdgeCurve3D` in model space plus `TrimCurve2D` p-curves on both input surfaces. `TrimReadyIntersectionCurve::split_faces` installs that output into the topology layer as staged split curves. The SSI path still intentionally stops before coplanar overlap handling, coincident-region classification, and full topology healing.
 
 ## Booleans
 

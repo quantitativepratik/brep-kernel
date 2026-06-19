@@ -7,6 +7,7 @@ Initial public prototype:
 - half-edge topology and Euler construction operators
 - analytic face support and trim-loop topology
 - 3D edge curves plus per-face 2D p-curves
+- staged face splitting from trim-ready SSI curves
 - NURBS curve/surface evaluation and derivatives
 - interval-filtered robust predicates
 - representative curve/surface intersections and trim-ready NURBS/NURBS SSI output
