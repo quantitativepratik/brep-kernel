@@ -47,7 +47,7 @@ The current filter can certify many cases and explicitly reports uncertainty for
 
 `src/intersection.rs` includes exact analytic intersections for linear primitives and marching/bracketing routines for NURBS cases.
 
-The plane/NURBS-surface routine marches over parameter-space cells and emits short polyline segments. The NURBS/NURBS surface routine takes the next step: it tessellates both parametric surfaces for discovery, intersects candidate triangle pairs, refines segment endpoints against the original NURBS evaluations with a small Gauss-Newton residual solve, and stitches the result into `TrimReadyIntersectionCurve` values. Each curve carries an `EdgeCurve3D` in model space plus `TrimCurve2D` p-curves on both input surfaces. `TrimReadyIntersectionCurve::split_faces` installs that output into the topology layer as staged split curves. The SSI path still intentionally stops before coplanar overlap handling, coincident-region classification, and full topology healing.
+The plane/NURBS-surface routine marches over parameter-space cells and emits short polyline segments. The NURBS/NURBS surface routine takes the next step: it tessellates both parametric surfaces for discovery, intersects candidate triangle pairs, refines segment endpoints against the original NURBS evaluations with a small Gauss-Newton residual solve, and stitches the result into `TrimReadyIntersectionCurve` values. Each curve carries an `EdgeCurve3D` in model space plus `TrimCurve2D` p-curves on both input surfaces. `TrimReadyIntersectionCurve::split_faces` installs that output into the topology layer as staged split curves. The SSI path still intentionally stops before coplanar overlap handling and coincident-region discovery.
 
 ## Booleans
 
@@ -58,6 +58,10 @@ The plane/NURBS-surface routine marches over parameter-space cells and emits sho
 - outer cube side walls
 
 The result is fed through the same half-edge constructor as every other solid. The regression test asserts closure and genus.
+
+For the general Boolean pipeline, `classify_split_faces` consumes staged topology splits. It samples each split p-curve against the face's trim domain, uses local surface partials and the opposite face normal to classify the UV-left and UV-right sides as inside or outside the opposite operand, then maps those sides to Union/Intersect/Subtract actions.
+
+`heal_classified_split_faces` promotes the supported subset of those decisions into output geometry. For a boundary-to-boundary split on a polyline-trimmable face, it walks the outer trim boundary, builds the kept trim loop for the requested side, evaluates the loop back onto the analytic face, triangulates the healed region, welds shared vertices, and tries to validate the result as a new half-edge `Solid`. If the regions are only a partial shell, the caller still receives the healed regions and mesh plus the topology validation error.
 
 ## GPU And Browser
 

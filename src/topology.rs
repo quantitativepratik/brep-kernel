@@ -180,6 +180,60 @@ pub enum FaceSurface {
 }
 
 impl FaceSurface {
+    /// Evaluate a point from the surface parameter domain when supported.
+    pub fn evaluate(&self, uv: Vec2) -> Option<Point3> {
+        match self {
+            Self::Plane(plane) => {
+                let (u_axis, v_axis) = plane_frame(*plane);
+                Some(plane.origin + u_axis * uv.x + v_axis * uv.y)
+            }
+            Self::Cylinder(cylinder) => Some(
+                cylinder.center
+                    + Vec3::new(
+                        cylinder.radius * uv.x.cos(),
+                        cylinder.radius * uv.x.sin(),
+                        uv.y,
+                    ),
+            ),
+            Self::Nurbs(surface) => Some(surface.evaluate(uv.x, uv.y)),
+            Self::Faceted => None,
+        }
+    }
+
+    /// Evaluate first partial derivatives `(du, dv)` when supported.
+    pub fn partials(&self, uv: Vec2) -> Option<(Vec3, Vec3)> {
+        match self {
+            Self::Plane(plane) => Some(plane_frame(*plane)),
+            Self::Cylinder(cylinder) => Some((
+                Vec3::new(
+                    -cylinder.radius * uv.x.sin(),
+                    cylinder.radius * uv.x.cos(),
+                    0.0,
+                ),
+                Vec3::new(0.0, 0.0, 1.0),
+            )),
+            Self::Nurbs(surface) => Some(surface.partials(uv.x, uv.y)),
+            Self::Faceted => None,
+        }
+    }
+
+    /// Evaluate an outward-oriented support normal when supported.
+    pub fn normal_at(&self, uv: Vec2) -> Option<Vec3> {
+        match self {
+            Self::Plane(plane) => Some(plane.normal),
+            Self::Cylinder(_) | Self::Nurbs(_) => {
+                let (du, dv) = self.partials(uv)?;
+                let normal = du.cross(dv).normalized();
+                if normal.norm() <= f64::EPSILON {
+                    None
+                } else {
+                    Some(normal)
+                }
+            }
+            Self::Faceted => None,
+        }
+    }
+
     /// Project a model-space point into the surface parameter domain when a direct projection exists.
     ///
     /// Planes use a deterministic orthonormal frame. Cylinders use `(angle, height)`
