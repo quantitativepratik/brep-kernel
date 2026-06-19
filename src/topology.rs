@@ -301,6 +301,20 @@ impl FaceSurface {
 
     /// Project a model-space point into the surface parameter domain with a tolerance.
     pub fn project_point_with_tolerance(&self, point: Point3, tolerance: f64) -> Option<Vec2> {
+        self.project_point_near(point, None, tolerance)
+    }
+
+    /// Project a model-space point using an optional nearby UV seed.
+    ///
+    /// The seed is ignored for direct analytic projections, but NURBS surfaces use
+    /// it as the first Newton candidate. This keeps a projected curve continuous
+    /// in parameter space instead of re-solving every sample from a global grid.
+    pub fn project_point_near(
+        &self,
+        point: Point3,
+        seed: Option<Vec2>,
+        tolerance: f64,
+    ) -> Option<Vec2> {
         match self {
             Self::Plane(plane) => {
                 let (u_axis, v_axis) = plane_frame(*plane);
@@ -311,7 +325,9 @@ impl FaceSurface {
                 let d = point - cylinder.center;
                 Some(Vec2::new(d.y.atan2(d.x), d.z))
             }
-            Self::Nurbs(surface) => inverse_project_nurbs(surface, point, tolerance),
+            Self::Nurbs(surface) => {
+                inverse_project_nurbs_with_seed(surface, point, seed, tolerance)
+            }
             Self::Faceted => None,
         }
     }
@@ -1545,12 +1561,13 @@ impl Solid {
         }
 
         let surface = &self.faces[face].surface;
-        let mut uv_points = Vec::with_capacity(model_points.len());
-        for point in model_points {
-            let uv = surface.project_point_with_tolerance(point, tolerance)?;
-            uv_points.push(uv);
-        }
-        pcurve_from_uv_samples(&uv_points, tolerance)
+        let mut uv_points = project_model_points_to_surface(surface, &model_points, tolerance)?;
+        let start_uv = surface.project_point_near(start, uv_points.first().copied(), tolerance)?;
+        let end_uv = surface.project_point_near(end, uv_points.last().copied(), tolerance)?;
+        *uv_points.first_mut()? = start_uv;
+        *uv_points.last_mut()? = end_uv;
+        let pcurve = pcurve_from_uv_samples(&uv_points, tolerance)?;
+        Some(trim_curve_with_endpoints(pcurve, start_uv, end_uv))
     }
 }
 
@@ -1602,29 +1619,101 @@ fn normalized_index(index: usize, samples: usize) -> f64 {
     }
 }
 
-fn inverse_project_nurbs(surface: &NurbsSurface, point: Point3, tolerance: f64) -> Option<Vec2> {
-    let ((u0, u1), (v0, v1)) = surface.domain();
-    let mut best_uv = Vec2::new(u0, v0);
-    let mut best_distance = f64::INFINITY;
-    for j in 0..=4 {
-        for i in 0..=4 {
-            let u = lerp_scalar(u0, u1, i as f64 / 4.0);
-            let v = lerp_scalar(v0, v1, j as f64 / 4.0);
-            let distance = surface.evaluate(u, v).distance(point);
-            if distance < best_distance {
-                best_distance = distance;
-                best_uv = Vec2::new(u, v);
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SurfaceProjection {
+    uv: Vec2,
+    residual: f64,
+}
+
+fn inverse_project_nurbs_with_seed(
+    surface: &NurbsSurface,
+    point: Point3,
+    seed: Option<Vec2>,
+    tolerance: f64,
+) -> Option<Vec2> {
+    if let Some(seed) = seed {
+        if let Some(projected) = refine_nurbs_projection(surface, point, seed, tolerance) {
+            if projected.residual <= tolerance {
+                return Some(projected.uv);
             }
         }
     }
 
-    let mut uv = best_uv;
-    for _ in 0..32 {
+    let projected = global_nurbs_projection(surface, point, seed, tolerance)?;
+    if projected.residual <= tolerance {
+        Some(projected.uv)
+    } else {
+        None
+    }
+}
+
+fn global_nurbs_projection(
+    surface: &NurbsSurface,
+    point: Point3,
+    seed: Option<Vec2>,
+    tolerance: f64,
+) -> Option<SurfaceProjection> {
+    let ((u0, u1), (v0, v1)) = surface.domain();
+    let mut best = None;
+    if let Some(seed) = seed {
+        best = refine_nurbs_projection(surface, point, clamp_uv(seed, u0, u1, v0, v1), tolerance);
+    }
+    for j in 0..=4 {
+        for i in 0..=4 {
+            let u = lerp_scalar(u0, u1, i as f64 / 4.0);
+            let v = lerp_scalar(v0, v1, j as f64 / 4.0);
+            let candidate = refine_nurbs_projection(surface, point, Vec2::new(u, v), tolerance);
+            best = choose_projection(best, candidate, seed);
+        }
+    }
+
+    best
+}
+
+fn choose_projection(
+    current: Option<SurfaceProjection>,
+    candidate: Option<SurfaceProjection>,
+    seed: Option<Vec2>,
+) -> Option<SurfaceProjection> {
+    let Some(candidate) = candidate else {
+        return current;
+    };
+    let Some(current) = current else {
+        return Some(candidate);
+    };
+    let residual_delta = candidate.residual - current.residual;
+    if residual_delta < -1.0e-12 {
+        return Some(candidate);
+    }
+    if residual_delta.abs() <= 1.0e-12 {
+        if let Some(seed) = seed {
+            let current_distance = vec2_distance(current.uv, seed);
+            let candidate_distance = vec2_distance(candidate.uv, seed);
+            if candidate_distance < current_distance {
+                return Some(candidate);
+            }
+        }
+    }
+    Some(current)
+}
+
+fn refine_nurbs_projection(
+    surface: &NurbsSurface,
+    point: Point3,
+    seed: Vec2,
+    tolerance: f64,
+) -> Option<SurfaceProjection> {
+    let ((u0, u1), (v0, v1)) = surface.domain();
+    let mut uv = clamp_uv(seed, u0, u1, v0, v1);
+    let mut residual_norm = surface.evaluate(uv.x, uv.y).distance(point);
+    if !residual_norm.is_finite() {
+        return None;
+    }
+
+    for _ in 0..40 {
         let surface_point = surface.evaluate(uv.x, uv.y);
         let residual = surface_point - point;
-        if residual.norm() <= tolerance {
-            return Some(uv);
-        }
+        residual_norm = residual.norm();
         let (du, dv) = surface.partials(uv.x, uv.y);
         let a00 = du.dot(du);
         let a01 = du.dot(dv);
@@ -1632,23 +1721,57 @@ fn inverse_project_nurbs(surface: &NurbsSurface, point: Point3, tolerance: f64) 
         let b0 = -du.dot(residual);
         let b1 = -dv.dot(residual);
         let det = a00 * a11 - a01 * a01;
+        if residual_norm <= tolerance {
+            return Some(SurfaceProjection {
+                uv,
+                residual: residual_norm,
+            });
+        }
         if det.abs() <= 1.0e-18 {
             break;
         }
         let step_u = (b0 * a11 - b1 * a01) / det;
         let step_v = (a00 * b1 - a01 * b0) / det;
-        uv.x = (uv.x + step_u).clamp(u0, u1);
-        uv.y = (uv.y + step_v).clamp(v0, v1);
-        if step_u.hypot(step_v) <= tolerance * 0.1 {
+        if !step_u.is_finite() || !step_v.is_finite() {
+            break;
+        }
+
+        let mut accepted = None;
+        let mut scale = 1.0;
+        for _ in 0..8 {
+            let trial = clamp_uv(
+                Vec2::new(uv.x + step_u * scale, uv.y + step_v * scale),
+                u0,
+                u1,
+                v0,
+                v1,
+            );
+            let trial_residual = surface.evaluate(trial.x, trial.y).distance(point);
+            if trial_residual.is_finite() && trial_residual < residual_norm {
+                accepted = Some((trial, trial_residual, scale));
+                break;
+            }
+            scale *= 0.5;
+        }
+
+        let Some((trial, trial_residual, scale)) = accepted else {
+            break;
+        };
+        uv = trial;
+        residual_norm = trial_residual;
+        if step_u.hypot(step_v) * scale <= tolerance.max(1.0e-12) * 0.1 {
             break;
         }
     }
 
-    if surface.evaluate(uv.x, uv.y).distance(point) <= tolerance {
-        Some(uv)
-    } else {
-        None
-    }
+    Some(SurfaceProjection {
+        uv,
+        residual: residual_norm,
+    })
+}
+
+fn clamp_uv(uv: Vec2, u0: f64, u1: f64, v0: f64, v1: f64) -> Vec2 {
+    Vec2::new(uv.x.clamp(u0, u1), uv.y.clamp(v0, v1))
 }
 
 fn edge_curve_has_span(curve: &EdgeCurve3D, tolerance: f64) -> bool {
@@ -1678,6 +1801,7 @@ fn edge_curve_has_span(curve: &EdgeCurve3D, tolerance: f64) -> bool {
 }
 
 fn pcurve_from_uv_samples(points: &[Vec2], tolerance: f64) -> Option<TrimCurve2D> {
+    let points = compact_uv_samples(points, tolerance);
     if points.len() < 2 || points.iter().any(|point| !finite_vec2(*point)) {
         return None;
     }
@@ -1693,6 +1817,59 @@ fn pcurve_from_uv_samples(points: &[Vec2], tolerance: f64) -> Option<TrimCurve2D
         .collect();
     let curve = NurbsCurve::interpolate(&fit_points, 3, tolerance).ok()?;
     Some(TrimCurve2D::Nurbs(Box::new(curve)))
+}
+
+fn project_model_points_to_surface(
+    surface: &FaceSurface,
+    model_points: &[Point3],
+    tolerance: f64,
+) -> Option<Vec<Vec2>> {
+    let mut uv_points = Vec::with_capacity(model_points.len());
+    let mut seed = None;
+    for point in model_points {
+        let uv = surface.project_point_near(*point, seed, tolerance)?;
+        uv_points.push(uv);
+        seed = Some(uv);
+    }
+    Some(uv_points)
+}
+
+fn compact_uv_samples(points: &[Vec2], tolerance: f64) -> Vec<Vec2> {
+    let mut compact = Vec::with_capacity(points.len());
+    for point in points {
+        if compact
+            .last()
+            .is_none_or(|last| vec2_distance(*last, *point) > tolerance)
+        {
+            compact.push(*point);
+        }
+    }
+    compact
+}
+
+fn trim_curve_with_endpoints(curve: TrimCurve2D, start: Vec2, end: Vec2) -> TrimCurve2D {
+    match curve {
+        TrimCurve2D::LineSegment { .. } => TrimCurve2D::LineSegment { start, end },
+        TrimCurve2D::Polyline { mut points } => {
+            if let Some(first) = points.first_mut() {
+                *first = start;
+            }
+            if let Some(last) = points.last_mut() {
+                *last = end;
+            }
+            TrimCurve2D::Polyline { points }
+        }
+        TrimCurve2D::Nurbs(mut curve) => {
+            if let Some(first) = curve.control_points.first_mut() {
+                *first = Point3::new(start.x, start.y, 0.0);
+            }
+            if let Some(last) = curve.control_points.last_mut() {
+                *last = Point3::new(end.x, end.y, 0.0);
+            }
+            TrimCurve2D::Nurbs(curve)
+        }
+        other => other,
+    }
 }
 
 fn trim_loop_sample_points(
