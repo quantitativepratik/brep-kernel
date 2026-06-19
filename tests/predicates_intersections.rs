@@ -112,6 +112,7 @@ fn nurbs_nurbs_surface_intersection_finds_curved_curve() {
 
     let total_points: usize = curves.iter().map(|curve| curve.points.len()).sum();
     assert!(total_points >= 20);
+    assert!(curves.iter().any(|curve| curve.nurbs_fit.is_some()));
     for curve in &curves {
         assert_trim_ready_curve(curve);
     }
@@ -138,6 +139,19 @@ fn assert_trim_ready_curve(curve: &brep_kernel::intersection::TrimReadyIntersect
         EdgeCurve3D::Polyline { points } => {
             assert_eq!(points.len(), curve.points.len());
             assert_eq!(points[0], curve.points[0].point);
+        }
+        EdgeCurve3D::Nurbs(nurbs) => {
+            let fit = curve.nurbs_fit.expect("NURBS edge curve has fit report");
+            assert_eq!(fit.degree, nurbs.knots.degree);
+            assert!(fit.max_model_error < 1.0e-6);
+            let (u0, u1) = nurbs.domain();
+            assert!(nurbs.evaluate(u0).distance(curve.points[0].point) < 1.0e-6);
+            assert!(
+                nurbs
+                    .evaluate(u1)
+                    .distance(curve.points[curve.points.len() - 1].point)
+                    < 1.0e-6
+            );
         }
         other => panic!("unexpected trim-ready edge curve: {other:?}"),
     }
@@ -168,8 +182,23 @@ fn assert_pcurve_matches_samples(
             assert_eq!(points[0], uv(0));
             assert_eq!(points[points.len() - 1], uv(samples.len() - 1));
         }
+        TrimCurve2D::Nurbs(curve) => {
+            let (u0, u1) = curve.domain();
+            let start = curve.evaluate(u0);
+            let end = curve.evaluate(u1);
+            assert!(Vec2::new(start.x, start.y)
+                .dot(Vec2::new(1.0, 1.0))
+                .is_finite());
+            assert!(vec2_distance(Vec2::new(start.x, start.y), uv(0)) < 1.0e-6);
+            assert!(vec2_distance(Vec2::new(end.x, end.y), uv(samples.len() - 1)) < 1.0e-6);
+        }
         other => panic!("unexpected trim-ready p-curve: {other:?}"),
     }
+}
+
+fn vec2_distance(a: Vec2, b: Vec2) -> f64 {
+    let d = a - b;
+    d.dot(d).sqrt()
 }
 
 fn parabolic_x_surface() -> NurbsSurface {

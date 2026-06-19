@@ -7,6 +7,8 @@ use crate::predicates::{Interval, RobustSign};
 use crate::tessellation::tessellate_nurbs_surface;
 use crate::topology::{EdgeCurve3D, FaceId, Solid, SplitFacesReport, TopologyError, TrimCurve2D};
 
+const SSI_NURBS_FIT_TOLERANCE: f64 = 1.0e-6;
+
 /// Classification for a line-plane intersection.
 #[derive(Clone, Debug, PartialEq)]
 pub enum LinePlaneIntersection {
@@ -82,6 +84,19 @@ pub struct SurfaceSurfaceIntersectionPoint {
     pub residual: f64,
 }
 
+/// Error summary for NURBS curves fitted to trim-ready SSI samples.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NurbsIntersectionFit {
+    /// Fitted NURBS degree.
+    pub degree: usize,
+    /// Maximum model-space interpolation error at SSI samples.
+    pub max_model_error: f64,
+    /// Maximum first-surface p-curve interpolation error at SSI samples.
+    pub max_a_pcurve_error: f64,
+    /// Maximum second-surface p-curve interpolation error at SSI samples.
+    pub max_b_pcurve_error: f64,
+}
+
 /// Trim-ready approximation of a NURBS/NURBS surface intersection curve.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TrimReadyIntersectionCurve {
@@ -93,6 +108,8 @@ pub struct TrimReadyIntersectionCurve {
     pub a_pcurve: TrimCurve2D,
     /// P-curve on the second surface.
     pub b_pcurve: TrimCurve2D,
+    /// NURBS fitting summary when polyline SSI samples were promoted to fitted curves.
+    pub nurbs_fit: Option<NurbsIntersectionFit>,
     /// Maximum refined residual across samples.
     pub max_residual: f64,
 }
@@ -799,12 +816,39 @@ fn trim_ready_curve(
     let max_residual = points
         .iter()
         .fold(edge_residual, |acc, point| acc.max(point.residual));
+    let (edge_curve, a_pcurve, b_pcurve, nurbs_fit) = trim_ready_curves_from_samples(&points);
     TrimReadyIntersectionCurve {
-        edge_curve: edge_curve_from_samples(&points),
-        a_pcurve: pcurve_from_samples(&points, SurfaceSide::A),
-        b_pcurve: pcurve_from_samples(&points, SurfaceSide::B),
+        edge_curve,
+        a_pcurve,
+        b_pcurve,
+        nurbs_fit,
         points,
         max_residual,
+    }
+}
+
+fn trim_ready_curves_from_samples(
+    points: &[SurfaceSurfaceIntersectionPoint],
+) -> (
+    EdgeCurve3D,
+    TrimCurve2D,
+    TrimCurve2D,
+    Option<NurbsIntersectionFit>,
+) {
+    if let Some(fitted) = fit_nurbs_intersection_curves(points, SSI_NURBS_FIT_TOLERANCE) {
+        (
+            EdgeCurve3D::Nurbs(Box::new(fitted.edge_curve)),
+            TrimCurve2D::Nurbs(Box::new(fitted.a_pcurve)),
+            TrimCurve2D::Nurbs(Box::new(fitted.b_pcurve)),
+            Some(fitted.report),
+        )
+    } else {
+        (
+            edge_curve_from_samples(points),
+            pcurve_from_samples(points, SurfaceSide::A),
+            pcurve_from_samples(points, SurfaceSide::B),
+            None,
+        )
     }
 }
 
@@ -816,6 +860,94 @@ fn edge_curve_from_samples(points: &[SurfaceSurfaceIntersectionPoint]) -> EdgeCu
             points: points.iter().map(|sample| sample.point).collect(),
         }
     }
+}
+
+struct FittedIntersectionCurves {
+    edge_curve: NurbsCurve,
+    a_pcurve: NurbsCurve,
+    b_pcurve: NurbsCurve,
+    report: NurbsIntersectionFit,
+}
+
+fn fit_nurbs_intersection_curves(
+    points: &[SurfaceSurfaceIntersectionPoint],
+    tolerance: f64,
+) -> Option<FittedIntersectionCurves> {
+    if points.len() < 3 {
+        return None;
+    }
+    let degree = 3.min(points.len() - 1);
+    let model_points: Vec<Point3> = points.iter().map(|sample| sample.point).collect();
+    let a_points: Vec<Point3> = points
+        .iter()
+        .map(|sample| Point3::new(sample.a_uv.x, sample.a_uv.y, 0.0))
+        .collect();
+    let b_points: Vec<Point3> = points
+        .iter()
+        .map(|sample| Point3::new(sample.b_uv.x, sample.b_uv.y, 0.0))
+        .collect();
+
+    let edge_curve = NurbsCurve::interpolate(&model_points, degree, tolerance).ok()?;
+    let a_pcurve = NurbsCurve::interpolate(&a_points, degree, tolerance).ok()?;
+    let b_pcurve = NurbsCurve::interpolate(&b_points, degree, tolerance).ok()?;
+    let max_model_error = max_curve_fit_error(&edge_curve, &model_points, tolerance)?;
+    let max_a_pcurve_error = max_curve_fit_error(&a_pcurve, &a_points, tolerance)?;
+    let max_b_pcurve_error = max_curve_fit_error(&b_pcurve, &b_points, tolerance)?;
+    if max_model_error > tolerance
+        || max_a_pcurve_error > tolerance
+        || max_b_pcurve_error > tolerance
+    {
+        return None;
+    }
+    Some(FittedIntersectionCurves {
+        edge_curve,
+        a_pcurve,
+        b_pcurve,
+        report: NurbsIntersectionFit {
+            degree,
+            max_model_error,
+            max_a_pcurve_error,
+            max_b_pcurve_error,
+        },
+    })
+}
+
+fn max_curve_fit_error(curve: &NurbsCurve, points: &[Point3], tolerance: f64) -> Option<f64> {
+    let parameters = chord_length_parameters(points, tolerance)?;
+    Some(
+        points
+            .iter()
+            .zip(parameters)
+            .map(|(point, parameter)| point.distance(curve.evaluate(parameter)))
+            .fold(0.0, f64::max),
+    )
+}
+
+fn chord_length_parameters(points: &[Point3], tolerance: f64) -> Option<Vec<f64>> {
+    if points.len() < 2 {
+        return None;
+    }
+    let mut parameters = Vec::with_capacity(points.len());
+    parameters.push(0.0);
+    let mut total = 0.0;
+    for edge in points.windows(2) {
+        let length = edge[0].distance(edge[1]);
+        if length <= tolerance {
+            return None;
+        }
+        total += length;
+        parameters.push(total);
+    }
+    if total <= tolerance {
+        return None;
+    }
+    for parameter in &mut parameters {
+        *parameter /= total;
+    }
+    if let Some(last) = parameters.last_mut() {
+        *last = 1.0;
+    }
+    Some(parameters)
 }
 
 #[derive(Clone, Copy)]

@@ -33,14 +33,14 @@ Then open `http://localhost:8080/web/`.
 - Edge and face geometry: `EdgeCurve3D` model-space curves on topological edges, `FaceSurface` support surfaces, and outer/inner `TrimLoop`s with per-face 2D p-curves.
 - Euler construction operators: `MVFS`, `MEV`, and `MEF`, with count invariants and conversion into validated half-edge solids.
 - Analytic primitives: lines, planes, circles, boxes, cylinders.
-- NURBS curves and surfaces: clamped/nonuniform knot vectors, rational evaluation, first derivatives, surface normals, curve knot insertion.
+- NURBS curves and surfaces: clamped/nonuniform knot vectors, rational evaluation, first derivatives, surface normals, curve knot insertion, and global curve interpolation.
 - Numerical robustness layer: outward-rounded interval predicates for `orient2d`, `orient3d`, and `incircle2d`.
 - Intersections:
   - line-plane
   - plane-plane
   - NURBS-curve/plane via bracketing and bisection
   - plane/NURBS-surface via marching squares over the parametric domain
-  - NURBS/NURBS surface intersection via tessellated discovery, NURBS residual refinement, and trim-ready 3D/p-curve output
+  - NURBS/NURBS surface intersection via tessellated discovery, NURBS residual refinement, trim-ready 3D/p-curve output, and conservative NURBS fitting of SSI polylines
 - Face splitting:
   - staged `SplitEdge` records with one model-space curve and per-face p-curves
   - rollback-safe installation of trim-ready SSI output onto two analytic faces

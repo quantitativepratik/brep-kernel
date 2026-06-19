@@ -293,6 +293,8 @@ pub enum TrimCurve2D {
         /// Ordered polyline points.
         points: Vec<Vec2>,
     },
+    /// NURBS p-curve. The curve's `(x, y)` coordinates are face `(u, v)`.
+    Nurbs(Box<NurbsCurve>),
     /// Topological trim exists, but the p-curve has not been fitted or projected yet.
     Unresolved,
 }
@@ -312,6 +314,12 @@ impl TrimCurve2D {
                 *center + Vec2::new(end_angle.cos() * *radius, end_angle.sin() * *radius),
             )),
             Self::Polyline { points } => Some((*points.first()?, *points.last()?)),
+            Self::Nurbs(curve) => {
+                let (u0, u1) = curve.domain();
+                let start = curve.evaluate(u0);
+                let end = curve.evaluate(u1);
+                Some((Vec2::new(start.x, start.y), Vec2::new(end.x, end.y)))
+            }
             Self::Unresolved => None,
         }
     }
@@ -333,6 +341,15 @@ impl TrimCurve2D {
             }
             Self::Polyline { points } => {
                 points.len() >= 2 && points.iter().all(|point| finite_vec2(*point))
+            }
+            Self::Nurbs(curve) => {
+                let (u0, u1) = curve.domain();
+                let start = curve.evaluate(u0);
+                let end = curve.evaluate(u1);
+                u0.is_finite()
+                    && u1.is_finite()
+                    && finite_vec2(Vec2::new(start.x, start.y))
+                    && finite_vec2(Vec2::new(end.x, end.y))
             }
             Self::Unresolved => true,
         }

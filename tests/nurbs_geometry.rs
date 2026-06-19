@@ -42,6 +42,24 @@ fn knot_insertion_preserves_curve_shape() {
 }
 
 #[test]
+fn global_interpolation_fits_points_with_open_nurbs_curve() {
+    let points = vec![
+        Point3::new(0.0, 0.0, 0.0),
+        Point3::new(0.25, 0.5, 0.0),
+        Point3::new(0.5, 0.25, 0.0),
+        Point3::new(0.75, 0.75, 0.0),
+        Point3::new(1.0, 0.0, 0.0),
+    ];
+    let curve = NurbsCurve::interpolate(&points, 3, 1.0e-12).unwrap();
+    let (u0, u1) = curve.domain();
+
+    assert_eq!(curve.knots.degree, 3);
+    assert!(curve.evaluate(u0).distance(points[0]) < 1.0e-10);
+    assert!(curve.evaluate(u1).distance(points[points.len() - 1]) < 1.0e-10);
+    assert_eq!(curve.control_points.len(), points.len());
+}
+
+#[test]
 fn bilinear_surface_has_stable_normal_and_tessellation() {
     let surface = NurbsSurface::bilinear([
         [Point3::new(-1.0, -1.0, 0.0), Point3::new(1.0, -1.0, 0.0)],

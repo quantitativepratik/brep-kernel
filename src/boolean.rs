@@ -966,6 +966,14 @@ fn append_trim_curve_points(points: &mut Vec<Vec2>, curve: &TrimCurve2D) -> Opti
                 push_unique_uv(points, *point);
             }
         }
+        TrimCurve2D::Nurbs(curve) => {
+            let (u0, u1) = curve.domain();
+            for i in 0..=32 {
+                let u = u0 * (1.0 - i as f64 / 32.0) + u1 * (i as f64 / 32.0);
+                let point = curve.evaluate(u);
+                push_unique_uv(points, Vec2::new(point.x, point.y));
+            }
+        }
         TrimCurve2D::Unresolved => return None,
     }
     Some(())
@@ -1031,6 +1039,18 @@ fn sample_pcurve_points(curve: &TrimCurve2D) -> Option<Vec<Vec2>> {
                 samples.push(edge[1]);
             }
             Some(samples)
+        }
+        TrimCurve2D::Nurbs(curve) => {
+            let (u0, u1) = curve.domain();
+            Some(
+                (0..=32)
+                    .map(|i| {
+                        let t = i as f64 / 32.0;
+                        let point = curve.evaluate(u0 * (1.0 - t) + u1 * t);
+                        Vec2::new(point.x, point.y)
+                    })
+                    .collect(),
+            )
         }
         TrimCurve2D::Unresolved => None,
     }
@@ -1103,6 +1123,18 @@ fn representative_pcurve_sample(curve: &TrimCurve2D, tolerance: f64) -> Option<(
                 }
             }
             best
+        }
+        TrimCurve2D::Nurbs(curve) => {
+            let (u0, u1) = curve.domain();
+            let u = (u0 + u1) * 0.5;
+            let point = curve.evaluate(u);
+            let tangent = curve.derivative(u);
+            let tangent = Vec2::new(tangent.x, tangent.y);
+            if vec2_norm(tangent) <= tolerance {
+                None
+            } else {
+                Some((Vec2::new(point.x, point.y), tangent))
+            }
         }
         TrimCurve2D::Unresolved => None,
     }

@@ -105,6 +105,34 @@ impl NurbsCurve {
         })
     }
 
+    /// Interpolate points with a non-rational open B-spline curve.
+    ///
+    /// This uses chord-length parameters and the standard averaging knot
+    /// vector for global interpolation. The returned curve has unit weights,
+    /// degree `degree.min(points.len() - 1)`, and passes through every input
+    /// point up to the linear solve tolerance.
+    pub fn interpolate(
+        points: &[Point3],
+        degree: usize,
+        tolerance: f64,
+    ) -> Result<Self, NurbsError> {
+        if points.len() < 2
+            || degree == 0
+            || !tolerance.is_finite()
+            || tolerance < 0.0
+            || points.iter().any(|point| !finite_point(*point))
+        {
+            return Err(NurbsError::InvalidParameter);
+        }
+        let degree = degree.min(points.len() - 1);
+        let parameters = chord_length_parameters(points, tolerance)?;
+        let knots = interpolation_knots(&parameters, degree);
+        let matrix = interpolation_matrix(&parameters, degree, &knots);
+        let control_points = solve_point_system(matrix, points, tolerance)?;
+        let weights = vec![1.0; control_points.len()];
+        Self::new(degree, knots, control_points, weights)
+    }
+
     /// Parametric domain.
     pub fn domain(&self) -> (f64, f64) {
         self.knots.domain()
@@ -191,6 +219,138 @@ impl NurbsCurve {
         }
         c
     }
+}
+
+fn chord_length_parameters(points: &[Point3], tolerance: f64) -> Result<Vec<f64>, NurbsError> {
+    let mut parameters = Vec::with_capacity(points.len());
+    parameters.push(0.0);
+    let mut total = 0.0;
+    for edge in points.windows(2) {
+        let length = edge[0].distance(edge[1]);
+        if length <= tolerance {
+            return Err(NurbsError::InvalidParameter);
+        }
+        total += length;
+        parameters.push(total);
+    }
+    if total <= tolerance {
+        return Err(NurbsError::InvalidParameter);
+    }
+    for parameter in &mut parameters {
+        *parameter /= total;
+    }
+    if let Some(last) = parameters.last_mut() {
+        *last = 1.0;
+    }
+    Ok(parameters)
+}
+
+fn interpolation_knots(parameters: &[f64], degree: usize) -> Vec<f64> {
+    let point_count = parameters.len();
+    let n = point_count - 1;
+    let mut knots = vec![0.0; point_count + degree + 1];
+    for knot in knots.iter_mut().take(point_count + degree + 1).skip(n + 1) {
+        *knot = 1.0;
+    }
+    if n > degree {
+        for j in 1..=(n - degree) {
+            let sum: f64 = parameters.iter().skip(j).take(degree).sum();
+            knots[j + degree] = sum / degree as f64;
+        }
+    }
+    knots
+}
+
+fn interpolation_matrix(parameters: &[f64], degree: usize, knots: &[f64]) -> Vec<Vec<f64>> {
+    let point_count = parameters.len();
+    let knot_vector = KnotVector {
+        degree,
+        knots: knots.to_vec(),
+    };
+    let mut matrix = vec![vec![0.0; point_count]; point_count];
+    for (row, parameter) in parameters.iter().copied().enumerate() {
+        let span = knot_vector.find_span(point_count, parameter);
+        let basis = basis_funs(span, parameter, degree, knots);
+        for (offset, value) in basis.into_iter().enumerate() {
+            matrix[row][span - degree + offset] = value;
+        }
+    }
+    matrix
+}
+
+fn solve_point_system(
+    matrix: Vec<Vec<f64>>,
+    points: &[Point3],
+    tolerance: f64,
+) -> Result<Vec<Point3>, NurbsError> {
+    let x = solve_scalar_system(
+        matrix.clone(),
+        points.iter().map(|point| point.x).collect(),
+        tolerance,
+    )?;
+    let y = solve_scalar_system(
+        matrix.clone(),
+        points.iter().map(|point| point.y).collect(),
+        tolerance,
+    )?;
+    let z = solve_scalar_system(
+        matrix,
+        points.iter().map(|point| point.z).collect(),
+        tolerance,
+    )?;
+    Ok((0..points.len())
+        .map(|index| Point3::new(x[index], y[index], z[index]))
+        .collect())
+}
+
+fn solve_scalar_system(
+    mut matrix: Vec<Vec<f64>>,
+    mut rhs: Vec<f64>,
+    tolerance: f64,
+) -> Result<Vec<f64>, NurbsError> {
+    let n = rhs.len();
+    for pivot_col in 0..n {
+        let mut pivot_row = pivot_col;
+        let mut pivot_abs = matrix[pivot_col][pivot_col].abs();
+        for (row, values) in matrix.iter().enumerate().take(n).skip(pivot_col + 1) {
+            let candidate = values[pivot_col].abs();
+            if candidate > pivot_abs {
+                pivot_abs = candidate;
+                pivot_row = row;
+            }
+        }
+        if pivot_abs <= tolerance.max(1.0e-14) {
+            return Err(NurbsError::InvalidParameter);
+        }
+        if pivot_row != pivot_col {
+            matrix.swap(pivot_col, pivot_row);
+            rhs.swap(pivot_col, pivot_row);
+        }
+        let pivot = matrix[pivot_col][pivot_col];
+        for value in matrix[pivot_col].iter_mut().skip(pivot_col) {
+            *value /= pivot;
+        }
+        rhs[pivot_col] /= pivot;
+        let pivot_values = matrix[pivot_col].clone();
+        for row in 0..n {
+            if row == pivot_col {
+                continue;
+            }
+            let factor = matrix[row][pivot_col];
+            if factor.abs() <= f64::EPSILON {
+                continue;
+            }
+            for (col, pivot_value) in pivot_values.iter().enumerate().skip(pivot_col) {
+                matrix[row][col] -= factor * pivot_value;
+            }
+            rhs[row] -= factor * rhs[pivot_col];
+        }
+    }
+    Ok(rhs)
+}
+
+fn finite_point(point: Point3) -> bool {
+    point.x.is_finite() && point.y.is_finite() && point.z.is_finite()
 }
 
 /// Rational tensor-product B-spline surface.

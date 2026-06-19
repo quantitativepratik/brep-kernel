@@ -10,9 +10,9 @@ Initial public prototype:
 - staged face splitting from trim-ready SSI curves
 - Boolean classification over staged split faces
 - healed Boolean trim-region generation for supported split faces
-- NURBS curve/surface evaluation and derivatives
+- NURBS curve/surface evaluation, derivatives, and curve interpolation
 - interval-filtered robust predicates
-- representative curve/surface intersections and trim-ready NURBS/NURBS SSI output
+- representative curve/surface intersections and trim-ready NURBS/NURBS SSI output with NURBS curve fitting
 - cube-minus-cylinder boolean reference case
 - natural-language to parametric feature-tree layer
 - golden reference models and property-based tests
