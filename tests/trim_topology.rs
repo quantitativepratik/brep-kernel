@@ -2,6 +2,7 @@ use brep_kernel::math::{Point3, Vec2};
 use brep_kernel::nurbs::NurbsSurface;
 use brep_kernel::topology::{
     FaceSurface, Solid, TopologyError, Trim, TrimCurve2D, TrimLoop, TrimLoopKind,
+    TrimLoopOrientation,
 };
 
 #[test]
@@ -92,6 +93,103 @@ fn face_can_carry_nurbs_surface_and_parametric_trim_loop() {
         )],
     )
     .unwrap();
+    cube.validate_trim_topology().unwrap();
+}
+
+#[test]
+fn trim_loop_analysis_reports_orientation_and_nesting() {
+    let mut cube = Solid::cube(2.0).unwrap();
+    cube.set_face_trim_loops(
+        0,
+        vec![
+            square_loop(
+                TrimLoopKind::Outer,
+                [
+                    Vec2::new(-1.0, -1.0),
+                    Vec2::new(1.0, -1.0),
+                    Vec2::new(1.0, 1.0),
+                    Vec2::new(-1.0, 1.0),
+                ],
+            ),
+            square_loop(
+                TrimLoopKind::Inner,
+                [
+                    Vec2::new(-0.25, -0.25),
+                    Vec2::new(-0.25, 0.25),
+                    Vec2::new(0.25, 0.25),
+                    Vec2::new(0.25, -0.25),
+                ],
+            ),
+        ],
+    )
+    .unwrap();
+
+    let analysis = cube.analyze_trim_loop_nesting(0, 1.0e-9).unwrap();
+    assert_eq!(
+        analysis.loops[0].orientation,
+        TrimLoopOrientation::CounterClockwise
+    );
+    assert_eq!(analysis.loops[0].parent, None);
+    assert_eq!(analysis.loops[0].depth, 0);
+    assert_eq!(
+        analysis.loops[1].orientation,
+        TrimLoopOrientation::Clockwise
+    );
+    assert_eq!(analysis.loops[1].parent, Some(0));
+    assert_eq!(analysis.loops[1].depth, 1);
+    cube.validate_trim_loop_nesting(0, 1.0e-9).unwrap();
+}
+
+#[test]
+fn trim_loop_nesting_rejects_inner_loop_outside_outer_loop() {
+    let mut cube = Solid::cube(2.0).unwrap();
+    cube.set_face_trim_loops(
+        0,
+        vec![
+            square_loop(
+                TrimLoopKind::Outer,
+                [
+                    Vec2::new(-1.0, -1.0),
+                    Vec2::new(1.0, -1.0),
+                    Vec2::new(1.0, 1.0),
+                    Vec2::new(-1.0, 1.0),
+                ],
+            ),
+            square_loop(
+                TrimLoopKind::Inner,
+                [
+                    Vec2::new(2.0, 2.0),
+                    Vec2::new(2.5, 2.0),
+                    Vec2::new(2.5, 2.5),
+                    Vec2::new(2.0, 2.5),
+                ],
+            ),
+        ],
+    )
+    .unwrap();
+
+    assert_eq!(
+        cube.validate_trim_loop_nesting(0, 1.0e-9),
+        Err(TopologyError::InvalidTrimLoopNesting(0, 1))
+    );
+}
+
+#[test]
+fn pcurves_can_be_generated_on_nurbs_support_surface() {
+    let mut cube = Solid::cube(2.0).unwrap();
+    let surface = NurbsSurface::bilinear([
+        [Point3::new(-1.0, -1.0, -1.0), Point3::new(1.0, -1.0, -1.0)],
+        [Point3::new(-1.0, 1.0, -1.0), Point3::new(1.0, 1.0, -1.0)],
+    ]);
+
+    cube.set_face_surface(0, FaceSurface::Nurbs(Box::new(surface)))
+        .unwrap();
+    cube.generate_face_pcurves(0, 8, 1.0e-7).unwrap();
+
+    for trim in &cube.faces[0].trim_loops[0].trims {
+        assert!(matches!(trim.curve, TrimCurve2D::Nurbs(_)));
+        assert!(trim.curve.endpoints().is_some());
+    }
     cube.validate_trim_topology().unwrap();
 }
 

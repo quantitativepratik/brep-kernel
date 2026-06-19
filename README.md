@@ -30,7 +30,7 @@ Then open `http://localhost:8080/web/`.
 ## What Is Implemented
 
 - Half-edge topology for closed manifold triangle B-reps: vertices, half-edges, edges, faces, shells, solids, Euler/genus validation, signed volume.
-- Edge and face geometry: `EdgeCurve3D` model-space curves on topological edges, `FaceSurface` support surfaces, and outer/inner `TrimLoop`s with per-face 2D p-curves.
+- Edge and face geometry: `EdgeCurve3D` model-space curves on topological edges, `FaceSurface` support surfaces, outer/inner `TrimLoop`s with per-face 2D p-curves, trim-loop orientation/nesting analysis, and NURBS-surface p-curve generation.
 - Euler construction operators: `MVFS`, `MEV`, and `MEF`, with count invariants and conversion into validated half-edge solids.
 - Analytic primitives: lines, planes, circles, boxes, cylinders.
 - NURBS curves and surfaces: clamped/nonuniform knot vectors, rational evaluation, first derivatives, surface normals, curve knot insertion, and global curve interpolation.

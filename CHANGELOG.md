@@ -7,6 +7,7 @@ Initial public prototype:
 - half-edge topology and Euler construction operators
 - analytic face support and trim-loop topology
 - 3D edge curves plus per-face 2D p-curves
+- robust trim-loop orientation/nesting analysis and NURBS p-curve generation
 - staged face splitting from trim-ready SSI curves
 - Boolean classification over staged split faces
 - healed Boolean trim-region generation for supported split faces

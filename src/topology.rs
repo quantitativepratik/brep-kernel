@@ -3,6 +3,7 @@
 use crate::geometry::{Circle, Cylinder, Plane};
 use crate::math::{Point3, Vec2, Vec3};
 use crate::nurbs::{NurbsCurve, NurbsSurface};
+use crate::predicates::{orient2d, Interval, RobustSign};
 use std::collections::HashMap;
 
 /// Vertex identifier.
@@ -70,6 +71,19 @@ pub struct SplitEdge {
     pub tolerance: f64,
 }
 
+/// Trim-loop winding in a face parameter domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrimLoopOrientation {
+    /// Positive signed area in UV space.
+    CounterClockwise,
+    /// Negative signed area in UV space.
+    Clockwise,
+    /// Certified zero area.
+    Degenerate,
+    /// The interval area test could not certify a sign.
+    Uncertain,
+}
+
 /// Model-space curve carried by a topological edge.
 #[derive(Clone, Debug, PartialEq)]
 pub enum EdgeCurve3D {
@@ -129,6 +143,48 @@ impl EdgeCurve3D {
                 Some((curve.evaluate(u0), curve.evaluate(u1)))
             }
             Self::Polyline { points } => Some((*points.first()?, *points.last()?)),
+            Self::Unresolved => None,
+        }
+    }
+
+    /// Sample model-space points along the curve.
+    pub fn sample_points(&self, samples: usize) -> Option<Vec<Point3>> {
+        let samples = samples.max(2);
+        match self {
+            Self::LineSegment { start, end } => Some(
+                (0..samples)
+                    .map(|index| start.lerp(*end, normalized_index(index, samples)))
+                    .collect(),
+            ),
+            Self::CircularArc {
+                center,
+                normal,
+                radius,
+                start_angle,
+                end_angle,
+            } => {
+                let circle = Circle::new(*center, *normal, *radius);
+                Some(
+                    (0..samples)
+                        .map(|index| {
+                            let t = normalized_index(index, samples);
+                            circle.point_at(start_angle * (1.0 - t) + end_angle * t)
+                        })
+                        .collect(),
+                )
+            }
+            Self::Nurbs(curve) => {
+                let (u0, u1) = curve.domain();
+                Some(
+                    (0..samples)
+                        .map(|index| {
+                            let t = normalized_index(index, samples);
+                            curve.evaluate(u0 * (1.0 - t) + u1 * t)
+                        })
+                        .collect(),
+                )
+            }
+            Self::Polyline { points } => Some(resample_polyline3(points, samples)?),
             Self::Unresolved => None,
         }
     }
@@ -237,9 +293,14 @@ impl FaceSurface {
     /// Project a model-space point into the surface parameter domain when a direct projection exists.
     ///
     /// Planes use a deterministic orthonormal frame. Cylinders use `(angle, height)`
-    /// around the Z-aligned cylinder. NURBS inverse evaluation is deliberately not
-    /// hidden here, so this returns `None` for NURBS surfaces.
+    /// around the Z-aligned cylinder. NURBS surfaces use a small Newton inverse
+    /// solve and return `None` when the closest point is outside tolerance.
     pub fn project_point(&self, point: Point3) -> Option<Vec2> {
+        self.project_point_with_tolerance(point, DEFAULT_TRIM_TOLERANCE)
+    }
+
+    /// Project a model-space point into the surface parameter domain with a tolerance.
+    pub fn project_point_with_tolerance(&self, point: Point3, tolerance: f64) -> Option<Vec2> {
         match self {
             Self::Plane(plane) => {
                 let (u_axis, v_axis) = plane_frame(*plane);
@@ -250,7 +311,8 @@ impl FaceSurface {
                 let d = point - cylinder.center;
                 Some(Vec2::new(d.y.atan2(d.x), d.z))
             }
-            Self::Nurbs(_) | Self::Faceted => None,
+            Self::Nurbs(surface) => inverse_project_nurbs(surface, point, tolerance),
+            Self::Faceted => None,
         }
     }
 }
@@ -319,6 +381,49 @@ impl TrimCurve2D {
                 let start = curve.evaluate(u0);
                 let end = curve.evaluate(u1);
                 Some((Vec2::new(start.x, start.y), Vec2::new(end.x, end.y)))
+            }
+            Self::Unresolved => None,
+        }
+    }
+
+    /// Sample parameter-space points along the p-curve.
+    pub fn sample_points(&self, samples: usize) -> Option<Vec<Vec2>> {
+        let samples = samples.max(2);
+        match self {
+            Self::LineSegment { start, end } => Some(
+                (0..samples)
+                    .map(|index| {
+                        *start * (1.0 - normalized_index(index, samples))
+                            + *end * normalized_index(index, samples)
+                    })
+                    .collect(),
+            ),
+            Self::CircularArc {
+                center,
+                radius,
+                start_angle,
+                end_angle,
+            } => Some(
+                (0..samples)
+                    .map(|index| {
+                        let t = normalized_index(index, samples);
+                        let angle = start_angle * (1.0 - t) + end_angle * t;
+                        *center + Vec2::new(angle.cos() * *radius, angle.sin() * *radius)
+                    })
+                    .collect(),
+            ),
+            Self::Polyline { points } => Some(resample_polyline2(points, samples)?),
+            Self::Nurbs(curve) => {
+                let (u0, u1) = curve.domain();
+                Some(
+                    (0..samples)
+                        .map(|index| {
+                            let t = normalized_index(index, samples);
+                            let point = curve.evaluate(u0 * (1.0 - t) + u1 * t);
+                            Vec2::new(point.x, point.y)
+                        })
+                        .collect(),
+                )
             }
             Self::Unresolved => None,
         }
@@ -491,6 +596,32 @@ pub struct TopologyCounts {
     pub boundary_halfedges: usize,
 }
 
+/// One trim-loop record in a face nesting analysis.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrimLoopNesting {
+    /// Loop index on the face.
+    pub loop_index: usize,
+    /// Outer or inner loop role.
+    pub kind: TrimLoopKind,
+    /// Robustly classified loop orientation.
+    pub orientation: TrimLoopOrientation,
+    /// Floating signed area in UV space for diagnostics.
+    pub signed_area: f64,
+    /// Parent loop containing this loop, if any.
+    pub parent: Option<usize>,
+    /// Nesting depth, where top-level loops have depth zero.
+    pub depth: usize,
+}
+
+/// Trim-loop orientation and nesting analysis for one face.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrimLoopAnalysis {
+    /// Face that was analyzed.
+    pub face: FaceId,
+    /// Per-loop nesting records.
+    pub loops: Vec<TrimLoopNesting>,
+}
+
 /// Result of installing one split curve on two faces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SplitFacesReport {
@@ -547,6 +678,10 @@ pub enum TopologyError {
     InvalidTrimCurve(FaceId, usize, usize),
     /// Consecutive p-curves do not close within tolerance.
     OpenTrimLoop(FaceId, usize),
+    /// Trim loop nesting is inconsistent.
+    InvalidTrimLoopNesting(FaceId, usize),
+    /// A p-curve could not be generated for an edge on a face.
+    PcurveProjectionFailed(FaceId, HalfEdgeId),
 }
 
 impl Solid {
@@ -887,6 +1022,58 @@ impl Solid {
         Ok(())
     }
 
+    /// Generate p-curves for every half-edge trim on a face from its 3D edge curve.
+    ///
+    /// This is intended for analytic faces, especially NURBS support surfaces.
+    /// Edge curves are sampled in model space, inverse-projected into the face
+    /// parameter domain, and fitted with a non-rational NURBS p-curve when more
+    /// than two samples are requested.
+    pub fn generate_face_pcurves(
+        &mut self,
+        face: FaceId,
+        samples: usize,
+        tolerance: f64,
+    ) -> Result<(), TopologyError> {
+        if face >= self.faces.len() {
+            return Err(TopologyError::InvalidFace(face));
+        }
+        if !tolerance.is_finite() || tolerance < 0.0 {
+            return Err(TopologyError::InvalidFace(face));
+        }
+        let samples = samples.max(2);
+        let old_loops = self.faces[face].trim_loops.clone();
+        let trim_refs: Vec<(usize, usize, HalfEdgeId)> = self.faces[face]
+            .trim_loops
+            .iter()
+            .enumerate()
+            .flat_map(|(loop_index, trim_loop)| {
+                trim_loop
+                    .trims
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(trim_index, trim)| {
+                        trim.halfedge
+                            .map(|halfedge| (loop_index, trim_index, halfedge))
+                    })
+            })
+            .collect();
+
+        for (loop_index, trim_index, halfedge) in trim_refs {
+            let Some(pcurve) = self.pcurve_for_halfedge(face, halfedge, samples, tolerance) else {
+                self.faces[face].trim_loops = old_loops;
+                return Err(TopologyError::PcurveProjectionFailed(face, halfedge));
+            };
+            self.faces[face].trim_loops[loop_index].trims[trim_index].curve = pcurve;
+            self.faces[face].trim_loops[loop_index].trims[trim_index].tolerance = tolerance;
+        }
+
+        if let Err(error) = self.validate_trim_topology() {
+            self.faces[face].trim_loops = old_loops;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// Install a trim-ready split curve on two faces.
     ///
     /// This operation is the topological staging point after SSI and before
@@ -1019,6 +1206,111 @@ impl Solid {
             }
         }
         (outer, inner)
+    }
+
+    /// Analyze trim-loop orientation and nesting on a face.
+    pub fn analyze_trim_loop_nesting(
+        &self,
+        face: FaceId,
+        tolerance: f64,
+    ) -> Result<TrimLoopAnalysis, TopologyError> {
+        if face >= self.faces.len() {
+            return Err(TopologyError::InvalidFace(face));
+        }
+        if !tolerance.is_finite() || tolerance < 0.0 {
+            return Err(TopologyError::InvalidFace(face));
+        }
+        let face_record = &self.faces[face];
+        let mut sampled = Vec::<Vec<Vec2>>::with_capacity(face_record.trim_loops.len());
+        let mut records = Vec::<TrimLoopNesting>::with_capacity(face_record.trim_loops.len());
+        for (loop_index, trim_loop) in face_record.trim_loops.iter().enumerate() {
+            let Some(points) = trim_loop_sample_points(trim_loop, 16, tolerance) else {
+                return Err(TopologyError::InvalidTrimLoop(face, loop_index));
+            };
+            if points.len() < 3 {
+                return Err(TopologyError::InvalidTrimLoop(face, loop_index));
+            }
+            let signed_area = signed_loop_area(&points);
+            let orientation = robust_loop_orientation(&points);
+            sampled.push(points);
+            records.push(TrimLoopNesting {
+                loop_index,
+                kind: trim_loop.kind,
+                orientation,
+                signed_area,
+                parent: None,
+                depth: 0,
+            });
+        }
+
+        for child in 0..sampled.len() {
+            let probe = interior_probe(&sampled[child]);
+            let mut parent = None;
+            let mut parent_area = f64::INFINITY;
+            for candidate in 0..sampled.len() {
+                if candidate == child {
+                    continue;
+                }
+                let area = records[candidate].signed_area.abs();
+                if area <= records[child].signed_area.abs() {
+                    continue;
+                }
+                if matches!(
+                    classify_point_in_loop(probe, &sampled[candidate], tolerance),
+                    LoopPointLocation::Inside | LoopPointLocation::Boundary
+                ) && area < parent_area
+                {
+                    parent = Some(candidate);
+                    parent_area = area;
+                }
+            }
+            records[child].parent = parent;
+        }
+
+        for index in 0..records.len() {
+            records[index].depth = nesting_depth(index, &records);
+        }
+
+        Ok(TrimLoopAnalysis {
+            face,
+            loops: records,
+        })
+    }
+
+    /// Validate that inner trim loops are nested inside the outer loop.
+    pub fn validate_trim_loop_nesting(
+        &self,
+        face: FaceId,
+        tolerance: f64,
+    ) -> Result<(), TopologyError> {
+        let analysis = self.analyze_trim_loop_nesting(face, tolerance)?;
+        for record in &analysis.loops {
+            match record.kind {
+                TrimLoopKind::Outer => {
+                    if record.parent.is_some() || record.depth != 0 {
+                        return Err(TopologyError::InvalidTrimLoopNesting(
+                            face,
+                            record.loop_index,
+                        ));
+                    }
+                }
+                TrimLoopKind::Inner => {
+                    let Some(parent) = record.parent else {
+                        return Err(TopologyError::InvalidTrimLoopNesting(
+                            face,
+                            record.loop_index,
+                        ));
+                    };
+                    if analysis.loops[parent].kind != TrimLoopKind::Outer {
+                        return Err(TopologyError::InvalidTrimLoopNesting(
+                            face,
+                            record.loop_index,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Count staged face-split uses across all faces.
@@ -1231,6 +1523,35 @@ impl Solid {
             }
         }
     }
+
+    fn pcurve_for_halfedge(
+        &self,
+        face: FaceId,
+        halfedge: HalfEdgeId,
+        samples: usize,
+        tolerance: f64,
+    ) -> Option<TrimCurve2D> {
+        if self.halfedges.get(halfedge)?.face != face {
+            return None;
+        }
+        let edge = self.edges.get(self.halfedges[halfedge].edge)?;
+        let mut model_points = edge.curve.sample_points(samples)?;
+        let start = self.vertices[self.halfedges[halfedge].origin].point;
+        let end = self.vertices[self.halfedges[self.halfedges[halfedge].next].origin].point;
+        let forward = model_points.first()?.distance(start) + model_points.last()?.distance(end);
+        let reverse = model_points.first()?.distance(end) + model_points.last()?.distance(start);
+        if reverse < forward {
+            model_points.reverse();
+        }
+
+        let surface = &self.faces[face].surface;
+        let mut uv_points = Vec::with_capacity(model_points.len());
+        for point in model_points {
+            let uv = surface.project_point_with_tolerance(point, tolerance)?;
+            uv_points.push(uv);
+        }
+        pcurve_from_uv_samples(&uv_points, tolerance)
+    }
 }
 
 /// Compute the unit normal of an indexed triangle.
@@ -1246,6 +1567,13 @@ const DEFAULT_TRIM_TOLERANCE: f64 = 1.0e-9;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const HASH_GRID: f64 = 1_000_000_000.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoopPointLocation {
+    Inside,
+    Boundary,
+    Outside,
+}
 
 fn plane_frame(plane: Plane) -> (Vec3, Vec3) {
     let helper = if plane.normal.x.abs() < 0.9 {
@@ -1264,6 +1592,63 @@ fn finite_vec2(value: Vec2) -> bool {
 
 fn finite_point3(value: Point3) -> bool {
     value.x.is_finite() && value.y.is_finite() && value.z.is_finite()
+}
+
+fn normalized_index(index: usize, samples: usize) -> f64 {
+    if samples <= 1 {
+        0.0
+    } else {
+        index as f64 / (samples - 1) as f64
+    }
+}
+
+fn inverse_project_nurbs(surface: &NurbsSurface, point: Point3, tolerance: f64) -> Option<Vec2> {
+    let ((u0, u1), (v0, v1)) = surface.domain();
+    let mut best_uv = Vec2::new(u0, v0);
+    let mut best_distance = f64::INFINITY;
+    for j in 0..=4 {
+        for i in 0..=4 {
+            let u = lerp_scalar(u0, u1, i as f64 / 4.0);
+            let v = lerp_scalar(v0, v1, j as f64 / 4.0);
+            let distance = surface.evaluate(u, v).distance(point);
+            if distance < best_distance {
+                best_distance = distance;
+                best_uv = Vec2::new(u, v);
+            }
+        }
+    }
+
+    let mut uv = best_uv;
+    for _ in 0..32 {
+        let surface_point = surface.evaluate(uv.x, uv.y);
+        let residual = surface_point - point;
+        if residual.norm() <= tolerance {
+            return Some(uv);
+        }
+        let (du, dv) = surface.partials(uv.x, uv.y);
+        let a00 = du.dot(du);
+        let a01 = du.dot(dv);
+        let a11 = dv.dot(dv);
+        let b0 = -du.dot(residual);
+        let b1 = -dv.dot(residual);
+        let det = a00 * a11 - a01 * a01;
+        if det.abs() <= 1.0e-18 {
+            break;
+        }
+        let step_u = (b0 * a11 - b1 * a01) / det;
+        let step_v = (a00 * b1 - a01 * b0) / det;
+        uv.x = (uv.x + step_u).clamp(u0, u1);
+        uv.y = (uv.y + step_v).clamp(v0, v1);
+        if step_u.hypot(step_v) <= tolerance * 0.1 {
+            break;
+        }
+    }
+
+    if surface.evaluate(uv.x, uv.y).distance(point) <= tolerance {
+        Some(uv)
+    } else {
+        None
+    }
 }
 
 fn edge_curve_has_span(curve: &EdgeCurve3D, tolerance: f64) -> bool {
@@ -1292,10 +1677,234 @@ fn edge_curve_has_span(curve: &EdgeCurve3D, tolerance: f64) -> bool {
     }
 }
 
+fn pcurve_from_uv_samples(points: &[Vec2], tolerance: f64) -> Option<TrimCurve2D> {
+    if points.len() < 2 || points.iter().any(|point| !finite_vec2(*point)) {
+        return None;
+    }
+    if points.len() == 2 {
+        return Some(TrimCurve2D::LineSegment {
+            start: points[0],
+            end: points[1],
+        });
+    }
+    let fit_points: Vec<Point3> = points
+        .iter()
+        .map(|point| Point3::new(point.x, point.y, 0.0))
+        .collect();
+    let curve = NurbsCurve::interpolate(&fit_points, 3, tolerance).ok()?;
+    Some(TrimCurve2D::Nurbs(Box::new(curve)))
+}
+
+fn trim_loop_sample_points(
+    trim_loop: &TrimLoop,
+    samples_per_trim: usize,
+    tolerance: f64,
+) -> Option<Vec<Vec2>> {
+    let mut points = Vec::new();
+    for trim in &trim_loop.trims {
+        let samples = trim.curve.sample_points(samples_per_trim)?;
+        for point in samples {
+            if points
+                .last()
+                .is_none_or(|last| vec2_distance(*last, point) > tolerance)
+            {
+                points.push(point);
+            }
+        }
+    }
+    if points.len() >= 2 && vec2_distance(points[0], points[points.len() - 1]) <= tolerance {
+        points.pop();
+    }
+    Some(points)
+}
+
+fn signed_loop_area(points: &[Vec2]) -> f64 {
+    if points.len() < 3 {
+        return 0.0;
+    }
+    let mut area = 0.0;
+    for i in 0..points.len() {
+        area += points[i].cross(points[(i + 1) % points.len()]);
+    }
+    area * 0.5
+}
+
+fn robust_loop_orientation(points: &[Vec2]) -> TrimLoopOrientation {
+    if points.len() < 3 {
+        return TrimLoopOrientation::Degenerate;
+    }
+    let mut sum = Interval::point(0.0);
+    for i in 0..points.len() {
+        let a = points[i];
+        let b = points[(i + 1) % points.len()];
+        let cross = Interval::point(a.x)
+            .mul_i(Interval::point(b.y))
+            .sub_i(Interval::point(a.y).mul_i(Interval::point(b.x)));
+        sum = sum.add_i(cross);
+    }
+    match sum.sign() {
+        RobustSign::Positive => TrimLoopOrientation::CounterClockwise,
+        RobustSign::Negative => TrimLoopOrientation::Clockwise,
+        RobustSign::Zero => TrimLoopOrientation::Degenerate,
+        RobustSign::Uncertain => TrimLoopOrientation::Uncertain,
+    }
+}
+
+fn interior_probe(points: &[Vec2]) -> Vec2 {
+    let mut centroid = Vec2::new(0.0, 0.0);
+    for point in points {
+        centroid = centroid + *point;
+    }
+    centroid * (1.0 / points.len() as f64)
+}
+
+fn classify_point_in_loop(point: Vec2, loop_points: &[Vec2], tolerance: f64) -> LoopPointLocation {
+    if loop_points.len() < 3 {
+        return LoopPointLocation::Outside;
+    }
+    let mut inside = false;
+    for i in 0..loop_points.len() {
+        let a = loop_points[i];
+        let b = loop_points[(i + 1) % loop_points.len()];
+        if point_segment_distance(point, a, b) <= tolerance || point_on_segment_robust(point, a, b)
+        {
+            return LoopPointLocation::Boundary;
+        }
+        let crosses_y = (a.y > point.y) != (b.y > point.y);
+        if crosses_y {
+            let x_at_y = a.x + (point.y - a.y) * (b.x - a.x) / (b.y - a.y);
+            if point.x < x_at_y {
+                inside = !inside;
+            }
+        }
+    }
+    if inside {
+        LoopPointLocation::Inside
+    } else {
+        LoopPointLocation::Outside
+    }
+}
+
+fn point_on_segment_robust(point: Vec2, a: Vec2, b: Vec2) -> bool {
+    orient2d(a, b, point) == RobustSign::Zero
+        && point.x >= a.x.min(b.x)
+        && point.x <= a.x.max(b.x)
+        && point.y >= a.y.min(b.y)
+        && point.y <= a.y.max(b.y)
+}
+
+fn point_segment_distance(point: Vec2, a: Vec2, b: Vec2) -> f64 {
+    let edge = b - a;
+    let len2 = edge.dot(edge);
+    if len2 <= f64::EPSILON {
+        return vec2_distance(point, a);
+    }
+    let t = ((point - a).dot(edge) / len2).clamp(0.0, 1.0);
+    vec2_distance(point, a + edge * t)
+}
+
+fn nesting_depth(index: usize, records: &[TrimLoopNesting]) -> usize {
+    let mut depth = 0;
+    let mut cursor = records[index].parent;
+    while let Some(parent) = cursor {
+        depth += 1;
+        cursor = records[parent].parent;
+    }
+    depth
+}
+
+fn resample_polyline2(points: &[Vec2], samples: usize) -> Option<Vec<Vec2>> {
+    let lengths = cumulative_lengths2(points)?;
+    let total = *lengths.last()?;
+    if total <= f64::EPSILON {
+        return None;
+    }
+    Some(
+        (0..samples)
+            .map(|index| {
+                interpolate_polyline2(points, &lengths, total * normalized_index(index, samples))
+            })
+            .collect(),
+    )
+}
+
+fn resample_polyline3(points: &[Point3], samples: usize) -> Option<Vec<Point3>> {
+    let lengths = cumulative_lengths3(points)?;
+    let total = *lengths.last()?;
+    if total <= f64::EPSILON {
+        return None;
+    }
+    Some(
+        (0..samples)
+            .map(|index| {
+                interpolate_polyline3(points, &lengths, total * normalized_index(index, samples))
+            })
+            .collect(),
+    )
+}
+
+fn cumulative_lengths2(points: &[Vec2]) -> Option<Vec<f64>> {
+    if points.len() < 2 {
+        return None;
+    }
+    let mut lengths = Vec::with_capacity(points.len());
+    lengths.push(0.0);
+    for edge in points.windows(2) {
+        lengths.push(lengths.last().copied()? + vec2_distance(edge[0], edge[1]));
+    }
+    Some(lengths)
+}
+
+fn cumulative_lengths3(points: &[Point3]) -> Option<Vec<f64>> {
+    if points.len() < 2 {
+        return None;
+    }
+    let mut lengths = Vec::with_capacity(points.len());
+    lengths.push(0.0);
+    for edge in points.windows(2) {
+        lengths.push(lengths.last().copied()? + edge[0].distance(edge[1]));
+    }
+    Some(lengths)
+}
+
+fn interpolate_polyline2(points: &[Vec2], lengths: &[f64], target: f64) -> Vec2 {
+    for i in 0..lengths.len() - 1 {
+        if target <= lengths[i + 1] {
+            let span = lengths[i + 1] - lengths[i];
+            let t = if span <= f64::EPSILON {
+                0.0
+            } else {
+                (target - lengths[i]) / span
+            };
+            return points[i] * (1.0 - t) + points[i + 1] * t;
+        }
+    }
+    *points.last().expect("polyline has points")
+}
+
+fn interpolate_polyline3(points: &[Point3], lengths: &[f64], target: f64) -> Point3 {
+    for i in 0..lengths.len() - 1 {
+        if target <= lengths[i + 1] {
+            let span = lengths[i + 1] - lengths[i];
+            let t = if span <= f64::EPSILON {
+                0.0
+            } else {
+                (target - lengths[i]) / span
+            };
+            return points[i].lerp(points[i + 1], t);
+        }
+    }
+    *points.last().expect("polyline has points")
+}
+
 fn vec2_distance(a: Vec2, b: Vec2) -> f64 {
     let dx = a.x - b.x;
     let dy = a.y - b.y;
     (dx * dx + dy * dy).sqrt()
+}
+
+fn lerp_scalar(a: f64, b: f64, t: f64) -> f64 {
+    a * (1.0 - t) + b * t
 }
 
 fn hash_u64(mut hash: u64, value: u64) -> u64 {

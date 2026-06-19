@@ -19,6 +19,8 @@ Edges now carry an `EdgeCurve3D` support curve in model space. Supported edge cu
 
 Faces carry an analytic `FaceSurface` support tag and ordered trim loops. Supported face surfaces are planes, Z-aligned cylinders, NURBS surfaces, and faceted fallbacks. Each `TrimLoop` is either outer or inner, contains ordered trims, and each trim can carry a 2D p-curve in that face's parameter domain. A single topological edge can therefore have one 3D curve and two distinct p-curves, one for each adjacent face. Triangle-mesh construction automatically gives every edge a 3D line segment and every planar face one projected outer trim loop.
 
+Trim loops can be sampled in UV space for interval-filtered orientation analysis and nesting checks. Inner loops can be validated against their containing outer loop, and analytic/NURBS p-curves can be regenerated from model-space edge curves by inverse-projecting samples onto the face support surface.
+
 The topology layer also has a staged face-splitting representation: a `SplitEdge` stores the shared 3D split curve outside the closed shell graph, and each participating face records a `FaceSplit` p-curve in its parameter domain. This lets SSI output be installed for later Boolean classification without corrupting the shell's Euler characteristic. The next layers are promoting those staged splits into healed trim loops, coedge-level tolerance metadata, and sewing/rewriting the affected shell topology.
 
 `src/euler.rs` provides the constructive Euler-operator layer above this final topology:
