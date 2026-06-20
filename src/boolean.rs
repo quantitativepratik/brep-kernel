@@ -14,8 +14,8 @@ use crate::intersection::{
 };
 use crate::math::{Point3, Vec2, Vec3};
 use crate::topology::{
-    EdgeCurve3D, FaceId, FaceSurface, SewingReport, Solid, SplitEdgeId, TopologyError, TrimCurve2D,
-    TrimLoopKind,
+    EdgeCurve3D, EdgeId, FaceId, FaceSurface, SewingReport, Solid, SplitEdgeId, TopologyError,
+    TrimCurve2D, TrimLoopKind, VertexId,
 };
 
 /// Boolean operation.
@@ -320,6 +320,8 @@ pub struct BooleanFacePairIntersection {
     pub status: BooleanFacePairStatus,
     /// Curve or segment intersections for this pair.
     pub curves: Vec<BooleanFaceIntersectionCurve>,
+    /// Point contacts for tangencies or zero-length overlaps.
+    pub contact_points: Vec<Point3>,
     /// Largest curve residual for this pair.
     pub max_residual: f64,
 }
@@ -343,6 +345,106 @@ pub struct BooleanIntersectionGraph {
     pub active_pair_count: usize,
     /// Total number of intersection curves across active pairs.
     pub curve_count: usize,
+}
+
+/// Classification of a tolerance merge relation between two edges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BooleanEdgeMergeKind {
+    /// Endpoints match in the same or reversed order.
+    Coincident,
+    /// Collinear edges overlap over a finite interval but do not have identical endpoints.
+    Overlapping,
+    /// The edges touch at a point within tolerance.
+    TangentTouch,
+    /// Endpoints are close enough to merge but not exactly coincident.
+    NearlyCoincident,
+}
+
+/// Classification of a tolerance merge relation between two faces.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BooleanFaceMergeKind {
+    /// Coplanar finite faces overlap in area.
+    CoplanarOverlap,
+    /// Nearly coplanar finite faces overlap in area within tolerance.
+    NearlyCoincident,
+    /// Faces touch at a point or along a numerically tiny interval.
+    TangentTouch,
+    /// Faces overlap or intersect in a finite curve.
+    Overlapping,
+}
+
+/// Cross-operand vertex merge candidate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BooleanMergedVertex {
+    /// Vertex in the left operand.
+    pub left_vertex: VertexId,
+    /// Vertex in the right operand.
+    pub right_vertex: VertexId,
+    /// Averaged representative point for later sewing.
+    pub merged_point: Point3,
+    /// Distance between the two source vertices.
+    pub distance: f64,
+}
+
+/// Cross-operand edge merge candidate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BooleanMergedEdge {
+    /// Edge in the left operand.
+    pub left_edge: EdgeId,
+    /// Edge in the right operand.
+    pub right_edge: EdgeId,
+    /// Merge/contact classification.
+    pub kind: BooleanEdgeMergeKind,
+    /// True when coincident endpoints match in reversed order.
+    pub reversed: bool,
+    /// Parametric overlap interval on the left edge, normalized to `[0, 1]`.
+    pub left_interval: (f64, f64),
+    /// Parametric overlap interval on the right edge, normalized to `[0, 1]`.
+    pub right_interval: (f64, f64),
+    /// Maximum distance used to certify this relation.
+    pub max_distance: f64,
+}
+
+/// Cross-operand face merge/contact candidate.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BooleanMergedFace {
+    /// Face in the left operand.
+    pub left_face: FaceId,
+    /// Face in the right operand.
+    pub right_face: FaceId,
+    /// Merge/contact classification.
+    pub kind: BooleanFaceMergeKind,
+    /// Maximum sampled plane/triangle distance used for the classification.
+    pub max_distance: f64,
+    /// Absolute angle between support normals, in radians.
+    pub normal_angle: f64,
+}
+
+/// Tolerance-aware merge analysis for Boolean operands.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BooleanTopologyMergeReport {
+    /// Tolerance used for all merge decisions.
+    pub tolerance: f64,
+    /// Vertex merge candidates.
+    pub vertices: Vec<BooleanMergedVertex>,
+    /// Edge merge/contact candidates.
+    pub edges: Vec<BooleanMergedEdge>,
+    /// Face merge/contact candidates.
+    pub faces: Vec<BooleanMergedFace>,
+    /// Number of vertex pairs within tolerance.
+    pub merged_vertex_count: usize,
+    /// Number of edge pairs within tolerance.
+    pub merged_edge_count: usize,
+    /// Number of face pairs within tolerance.
+    pub merged_face_count: usize,
+    /// Number of tangent point/zero-length contacts.
+    pub tangent_pair_count: usize,
+    /// Number of finite edge/face overlap relations.
+    pub overlapping_pair_count: usize,
+    /// Number of coplanar face overlap relations.
+    pub coplanar_pair_count: usize,
+    /// Number of nearly coincident edge/face relations.
+    pub nearly_coincident_pair_count: usize,
 }
 
 /// Intersect every face pair across two solids and build a face-pair graph.
@@ -389,6 +491,77 @@ pub fn build_face_intersection_graph(
         right_adjacency,
         active_pair_count,
         curve_count,
+    })
+}
+
+/// Analyze cross-operand coincident, near-coincident, overlapping, and tangent topology.
+///
+/// This pass does not mutate either solid. It creates the merge/contact records
+/// needed by later Boolean shell rewriting: vertices to sew, edges to reuse or
+/// split, and face pairs that require special overlap/tangent handling instead
+/// of ordinary crossing SSI.
+pub fn analyze_boolean_topology_merges(
+    left: &Solid,
+    right: &Solid,
+    tolerance: f64,
+) -> Result<BooleanTopologyMergeReport, BooleanError> {
+    if !tolerance.is_finite() || tolerance < 0.0 {
+        return Err(BooleanError::InvalidInput("tolerance must be nonnegative"));
+    }
+    left.validate()?;
+    right.validate()?;
+    let tolerance = tolerance.max(1.0e-9);
+
+    let vertices = analyze_vertex_merges(left, right, tolerance);
+    let edges = analyze_edge_merges(left, right, tolerance);
+    let faces = analyze_face_merges(left, right, tolerance);
+
+    let tangent_pair_count = edges
+        .iter()
+        .filter(|edge| edge.kind == BooleanEdgeMergeKind::TangentTouch)
+        .count()
+        + faces
+            .iter()
+            .filter(|face| face.kind == BooleanFaceMergeKind::TangentTouch)
+            .count();
+    let overlapping_pair_count = edges
+        .iter()
+        .filter(|edge| edge.kind == BooleanEdgeMergeKind::Overlapping)
+        .count()
+        + faces
+            .iter()
+            .filter(|face| {
+                matches!(
+                    face.kind,
+                    BooleanFaceMergeKind::Overlapping | BooleanFaceMergeKind::CoplanarOverlap
+                )
+            })
+            .count();
+    let coplanar_pair_count = faces
+        .iter()
+        .filter(|face| face.kind == BooleanFaceMergeKind::CoplanarOverlap)
+        .count();
+    let nearly_coincident_pair_count = edges
+        .iter()
+        .filter(|edge| edge.kind == BooleanEdgeMergeKind::NearlyCoincident)
+        .count()
+        + faces
+            .iter()
+            .filter(|face| face.kind == BooleanFaceMergeKind::NearlyCoincident)
+            .count();
+
+    Ok(BooleanTopologyMergeReport {
+        tolerance,
+        merged_vertex_count: vertices.len(),
+        merged_edge_count: edges.len(),
+        merged_face_count: faces.len(),
+        vertices,
+        edges,
+        faces,
+        tangent_pair_count,
+        overlapping_pair_count,
+        coplanar_pair_count,
+        nearly_coincident_pair_count,
     })
 }
 
@@ -714,6 +887,390 @@ fn push_point(points: &mut Vec<Point3>, point: Point3) -> usize {
     points.len() - 1
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SegmentDistance {
+    distance: f64,
+    left_t: f64,
+    right_t: f64,
+}
+
+fn analyze_vertex_merges(left: &Solid, right: &Solid, tolerance: f64) -> Vec<BooleanMergedVertex> {
+    let mut vertices = Vec::new();
+    for (left_vertex, left_record) in left.vertices.iter().enumerate() {
+        for (right_vertex, right_record) in right.vertices.iter().enumerate() {
+            let distance = left_record.point.distance(right_record.point);
+            if distance <= tolerance {
+                vertices.push(BooleanMergedVertex {
+                    left_vertex,
+                    right_vertex,
+                    merged_point: (left_record.point + right_record.point) * 0.5,
+                    distance,
+                });
+            }
+        }
+    }
+    vertices
+}
+
+fn analyze_edge_merges(left: &Solid, right: &Solid, tolerance: f64) -> Vec<BooleanMergedEdge> {
+    let mut edges = Vec::new();
+    for left_edge in 0..left.edges.len() {
+        let Some((left_start, left_end)) = left.edge_points(left_edge) else {
+            continue;
+        };
+        for right_edge in 0..right.edges.len() {
+            let Some((right_start, right_end)) = right.edge_points(right_edge) else {
+                continue;
+            };
+            if let Some(record) = classify_edge_merge(
+                left_edge,
+                left_start,
+                left_end,
+                right_edge,
+                right_start,
+                right_end,
+                tolerance,
+            ) {
+                edges.push(record);
+            }
+        }
+    }
+    edges
+}
+
+fn classify_edge_merge(
+    left_edge: EdgeId,
+    left_start: Point3,
+    left_end: Point3,
+    right_edge: EdgeId,
+    right_start: Point3,
+    right_end: Point3,
+    tolerance: f64,
+) -> Option<BooleanMergedEdge> {
+    let exact_tolerance = exact_merge_tolerance(tolerance);
+    let forward_distance = left_start
+        .distance(right_start)
+        .max(left_end.distance(right_end));
+    let reverse_distance = left_start
+        .distance(right_end)
+        .max(left_end.distance(right_start));
+    if forward_distance <= tolerance || reverse_distance <= tolerance {
+        let reversed = reverse_distance < forward_distance;
+        let max_distance = forward_distance.min(reverse_distance);
+        return Some(BooleanMergedEdge {
+            left_edge,
+            right_edge,
+            kind: if max_distance <= exact_tolerance {
+                BooleanEdgeMergeKind::Coincident
+            } else {
+                BooleanEdgeMergeKind::NearlyCoincident
+            },
+            reversed,
+            left_interval: (0.0, 1.0),
+            right_interval: (0.0, 1.0),
+            max_distance,
+        });
+    }
+
+    if let Some(record) = classify_collinear_edge_overlap(
+        left_edge,
+        left_start,
+        left_end,
+        right_edge,
+        right_start,
+        right_end,
+        tolerance,
+    ) {
+        return Some(record);
+    }
+
+    let distance = segment_segment_distance(left_start, left_end, right_start, right_end);
+    if distance.distance <= tolerance {
+        return Some(BooleanMergedEdge {
+            left_edge,
+            right_edge,
+            kind: BooleanEdgeMergeKind::TangentTouch,
+            reversed: false,
+            left_interval: (distance.left_t, distance.left_t),
+            right_interval: (distance.right_t, distance.right_t),
+            max_distance: distance.distance,
+        });
+    }
+    None
+}
+
+fn classify_collinear_edge_overlap(
+    left_edge: EdgeId,
+    left_start: Point3,
+    left_end: Point3,
+    right_edge: EdgeId,
+    right_start: Point3,
+    right_end: Point3,
+    tolerance: f64,
+) -> Option<BooleanMergedEdge> {
+    let left_vec = left_end - left_start;
+    let right_vec = right_end - right_start;
+    let left_len = left_vec.norm();
+    let right_len = right_vec.norm();
+    if left_len <= tolerance || right_len <= tolerance {
+        return None;
+    }
+    let left_axis = left_vec / left_len;
+    let right_axis = right_vec / right_len;
+    if left_axis.cross(right_axis).norm() > angular_merge_tolerance() {
+        return None;
+    }
+    if point_line_distance(right_start, left_start, left_axis) > tolerance
+        || point_line_distance(right_end, left_start, left_axis) > tolerance
+    {
+        return None;
+    }
+
+    let right_left_t0 = (right_start - left_start).dot(left_axis) / left_len;
+    let right_left_t1 = (right_end - left_start).dot(left_axis) / left_len;
+    let overlap_min = 0.0_f64.max(right_left_t0.min(right_left_t1));
+    let overlap_max = 1.0_f64.min(right_left_t0.max(right_left_t1));
+    if (overlap_max - overlap_min) * left_len <= tolerance {
+        return None;
+    }
+
+    let left_overlap_start = left_start.lerp(left_end, overlap_min);
+    let left_overlap_end = left_start.lerp(left_end, overlap_max);
+    let right_interval_a =
+        ((left_overlap_start - right_start).dot(right_axis) / right_len).clamp(0.0, 1.0);
+    let right_interval_b =
+        ((left_overlap_end - right_start).dot(right_axis) / right_len).clamp(0.0, 1.0);
+    let max_distance = point_segment_distance3(left_overlap_start, right_start, right_end).max(
+        point_segment_distance3(left_overlap_end, right_start, right_end),
+    );
+    Some(BooleanMergedEdge {
+        left_edge,
+        right_edge,
+        kind: BooleanEdgeMergeKind::Overlapping,
+        reversed: left_axis.dot(right_axis) < 0.0,
+        left_interval: (overlap_min, overlap_max),
+        right_interval: (
+            right_interval_a.min(right_interval_b),
+            right_interval_a.max(right_interval_b),
+        ),
+        max_distance,
+    })
+}
+
+fn analyze_face_merges(left: &Solid, right: &Solid, tolerance: f64) -> Vec<BooleanMergedFace> {
+    let mut faces = Vec::new();
+    for left_face in 0..left.faces.len() {
+        for right_face in 0..right.faces.len() {
+            if let Some(record) = classify_face_merge(left, right, left_face, right_face, tolerance)
+            {
+                faces.push(record);
+            }
+        }
+    }
+    faces
+}
+
+fn classify_face_merge(
+    left: &Solid,
+    right: &Solid,
+    left_face: FaceId,
+    right_face: FaceId,
+    tolerance: f64,
+) -> Option<BooleanMergedFace> {
+    let left_triangle = face_triangle(left, left_face)?;
+    let right_triangle = face_triangle(right, right_face)?;
+    if !triangle_bounds_overlap(&left_triangle, &right_triangle, tolerance) {
+        return None;
+    }
+    let left_plane = Plane::from_points(left_triangle[0], left_triangle[1], left_triangle[2])?;
+    let right_plane = Plane::from_points(right_triangle[0], right_triangle[1], right_triangle[2])?;
+    let normal_angle = normal_angle(left_plane.normal, right_plane.normal);
+    let left_to_right = triangle_signed_distances(&left_triangle, right_plane);
+    let right_to_left = triangle_signed_distances(&right_triangle, left_plane);
+    let max_plane_distance = left_to_right
+        .into_iter()
+        .chain(right_to_left)
+        .map(f64::abs)
+        .fold(0.0_f64, f64::max);
+    let parallel = left_plane.normal.cross(right_plane.normal).norm() <= angular_merge_tolerance();
+
+    if parallel
+        && max_plane_distance <= tolerance
+        && coplanar_triangles_overlap(
+            &left_triangle,
+            &right_triangle,
+            left_plane.normal,
+            tolerance,
+        )
+    {
+        return Some(BooleanMergedFace {
+            left_face,
+            right_face,
+            kind: if max_plane_distance <= exact_merge_tolerance(tolerance) {
+                BooleanFaceMergeKind::CoplanarOverlap
+            } else {
+                BooleanFaceMergeKind::NearlyCoincident
+            },
+            max_distance: max_plane_distance,
+            normal_angle,
+        });
+    }
+
+    match intersect_triangle_faces(left, right, left_face, right_face, tolerance) {
+        TriangleFaceIntersection::Touching(_) => Some(BooleanMergedFace {
+            left_face,
+            right_face,
+            kind: BooleanFaceMergeKind::TangentTouch,
+            max_distance: triangle_triangle_distance(&left_triangle, &right_triangle),
+            normal_angle,
+        }),
+        TriangleFaceIntersection::Segment { max_residual, .. } => Some(BooleanMergedFace {
+            left_face,
+            right_face,
+            kind: BooleanFaceMergeKind::Overlapping,
+            max_distance: max_residual,
+            normal_angle,
+        }),
+        TriangleFaceIntersection::Coincident => Some(BooleanMergedFace {
+            left_face,
+            right_face,
+            kind: BooleanFaceMergeKind::CoplanarOverlap,
+            max_distance: max_plane_distance,
+            normal_angle,
+        }),
+        TriangleFaceIntersection::Disjoint | TriangleFaceIntersection::Unsupported => {
+            let distance = triangle_triangle_distance(&left_triangle, &right_triangle);
+            if distance <= tolerance {
+                Some(BooleanMergedFace {
+                    left_face,
+                    right_face,
+                    kind: BooleanFaceMergeKind::TangentTouch,
+                    max_distance: distance,
+                    normal_angle,
+                })
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn segment_segment_distance(a0: Point3, a1: Point3, b0: Point3, b1: Point3) -> SegmentDistance {
+    let u = a1 - a0;
+    let v = b1 - b0;
+    let w = a0 - b0;
+    let a = u.dot(u);
+    let b = u.dot(v);
+    let c = v.dot(v);
+    let d = u.dot(w);
+    let e = v.dot(w);
+    let denom = a * c - b * b;
+    let mut s_numer;
+    let mut s_denom = denom;
+    let mut t_numer;
+    let mut t_denom = denom;
+    const EPS: f64 = 1.0e-12;
+
+    if denom < EPS {
+        s_numer = 0.0;
+        s_denom = 1.0;
+        t_numer = e;
+        t_denom = c;
+    } else {
+        s_numer = b * e - c * d;
+        t_numer = a * e - b * d;
+        if s_numer < 0.0 {
+            s_numer = 0.0;
+            t_numer = e;
+            t_denom = c;
+        } else if s_numer > s_denom {
+            s_numer = s_denom;
+            t_numer = e + b;
+            t_denom = c;
+        }
+    }
+
+    if t_numer < 0.0 {
+        t_numer = 0.0;
+        if -d < 0.0 {
+            s_numer = 0.0;
+        } else if -d > a {
+            s_numer = s_denom;
+        } else {
+            s_numer = -d;
+            s_denom = a;
+        }
+    } else if t_numer > t_denom {
+        t_numer = t_denom;
+        if -d + b < 0.0 {
+            s_numer = 0.0;
+        } else if -d + b > a {
+            s_numer = s_denom;
+        } else {
+            s_numer = -d + b;
+            s_denom = a;
+        }
+    }
+
+    let left_t = if s_numer.abs() < EPS {
+        0.0
+    } else {
+        s_numer / s_denom
+    }
+    .clamp(0.0, 1.0);
+    let right_t = if t_numer.abs() < EPS {
+        0.0
+    } else {
+        t_numer / t_denom
+    }
+    .clamp(0.0, 1.0);
+    SegmentDistance {
+        distance: (w + u * left_t - v * right_t).norm(),
+        left_t,
+        right_t,
+    }
+}
+
+fn triangle_triangle_distance(a: &[Point3; 3], b: &[Point3; 3]) -> f64 {
+    let mut distance = f64::INFINITY;
+    for point in a {
+        distance = distance.min(point_triangle_distance(*point, b));
+    }
+    for point in b {
+        distance = distance.min(point_triangle_distance(*point, a));
+    }
+    for i in 0..3 {
+        let a0 = a[i];
+        let a1 = a[(i + 1) % 3];
+        for j in 0..3 {
+            let b0 = b[j];
+            let b1 = b[(j + 1) % 3];
+            distance = distance.min(segment_segment_distance(a0, a1, b0, b1).distance);
+        }
+    }
+    distance
+}
+
+fn point_line_distance(point: Point3, line_origin: Point3, line_axis: Vec3) -> f64 {
+    (point - line_origin).cross(line_axis).norm()
+}
+
+fn normal_angle(a: Vec3, b: Vec3) -> f64 {
+    a.normalized()
+        .dot(b.normalized())
+        .abs()
+        .clamp(-1.0, 1.0)
+        .acos()
+}
+
+fn exact_merge_tolerance(tolerance: f64) -> f64 {
+    tolerance.clamp(1.0e-12, 1.0e-9)
+}
+
+fn angular_merge_tolerance() -> f64 {
+    1.0e-7
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum TriangleFaceIntersection {
     Disjoint,
@@ -741,6 +1298,7 @@ fn intersect_face_pair(
     tolerance: f64,
 ) -> BooleanFacePairIntersection {
     let mut curves = analytic_face_pair_curves(left, right, left_face, right_face, tolerance);
+    let mut contact_points = Vec::new();
     let mut status = if curves.is_empty() {
         BooleanFacePairStatus::Disjoint
     } else {
@@ -750,7 +1308,10 @@ fn intersect_face_pair(
     if curves.is_empty() {
         match intersect_triangle_faces(left, right, left_face, right_face, tolerance) {
             TriangleFaceIntersection::Disjoint => status = BooleanFacePairStatus::Disjoint,
-            TriangleFaceIntersection::Touching(_) => status = BooleanFacePairStatus::Touching,
+            TriangleFaceIntersection::Touching(point) => {
+                status = BooleanFacePairStatus::Touching;
+                push_unique_point3(&mut contact_points, point, tolerance);
+            }
             TriangleFaceIntersection::Segment {
                 start,
                 end,
@@ -781,6 +1342,7 @@ fn intersect_face_pair(
         right_face,
         status,
         curves,
+        contact_points,
         max_residual,
     }
 }

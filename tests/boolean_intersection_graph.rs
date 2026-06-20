@@ -1,4 +1,7 @@
-use brep_kernel::boolean::{build_face_intersection_graph, BooleanFacePairStatus};
+use brep_kernel::boolean::{
+    analyze_boolean_topology_merges, build_face_intersection_graph, BooleanEdgeMergeKind,
+    BooleanFaceMergeKind, BooleanFacePairStatus,
+};
 use brep_kernel::math::{Point3, Vec3};
 use brep_kernel::topology::Solid;
 
@@ -64,6 +67,70 @@ fn touching_solids_record_coincident_face_pairs() {
         .face_pairs
         .iter()
         .any(|pair| pair.status == BooleanFacePairStatus::Coincident));
+}
+
+#[test]
+fn merge_analysis_detects_coplanar_overlaps_and_shared_edges() {
+    let left = translated_box([2.0, 2.0, 2.0], Vec3::ZERO);
+    let right = translated_box([2.0, 2.0, 2.0], Vec3::new(2.0, 0.0, 0.0));
+
+    let report = analyze_boolean_topology_merges(&left, &right, 1.0e-8).unwrap();
+
+    assert!(report.merged_vertex_count >= 4);
+    assert!(report.merged_edge_count > 0);
+    assert!(report.merged_face_count > 0);
+    assert!(report.coplanar_pair_count > 0);
+    assert!(report.overlapping_pair_count > 0);
+    assert!(report
+        .edges
+        .iter()
+        .any(|edge| edge.kind == BooleanEdgeMergeKind::Coincident));
+    assert!(report
+        .faces
+        .iter()
+        .any(|face| face.kind == BooleanFaceMergeKind::CoplanarOverlap));
+}
+
+#[test]
+fn merge_analysis_detects_nearly_coincident_topology() {
+    let left = translated_box([2.0, 2.0, 2.0], Vec3::ZERO);
+    let right = translated_box([2.0, 2.0, 2.0], Vec3::new(2.0 + 5.0e-8, 0.0, 0.0));
+
+    let report = analyze_boolean_topology_merges(&left, &right, 1.0e-6).unwrap();
+
+    assert!(report.merged_vertex_count >= 4);
+    assert!(report.merged_edge_count > 0);
+    assert!(report.merged_face_count > 0);
+    assert!(report.nearly_coincident_pair_count > 0);
+    assert!(report
+        .edges
+        .iter()
+        .any(|edge| edge.kind == BooleanEdgeMergeKind::NearlyCoincident));
+    assert!(report
+        .faces
+        .iter()
+        .any(|face| face.kind == BooleanFaceMergeKind::NearlyCoincident));
+}
+
+#[test]
+fn merge_analysis_detects_tangent_corner_contacts() {
+    let left = translated_box([2.0, 2.0, 2.0], Vec3::ZERO);
+    let right = translated_box([2.0, 2.0, 2.0], Vec3::new(2.0, 2.0, 2.0));
+
+    let graph = build_face_intersection_graph(&left, &right, 1.0e-8).unwrap();
+    let report = analyze_boolean_topology_merges(&left, &right, 1.0e-8).unwrap();
+
+    assert!(graph
+        .face_pairs
+        .iter()
+        .any(|pair| pair.status == BooleanFacePairStatus::Touching
+            && !pair.contact_points.is_empty()));
+    assert!(report.merged_vertex_count >= 1);
+    assert!(report.tangent_pair_count > 0);
+    assert!(report
+        .faces
+        .iter()
+        .any(|face| face.kind == BooleanFaceMergeKind::TangentTouch));
 }
 
 fn translated_box(size: [f64; 3], offset: Vec3) -> Solid {

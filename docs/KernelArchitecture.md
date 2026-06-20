@@ -65,6 +65,8 @@ For the general Boolean pipeline, `classify_split_faces` consumes staged topolog
 
 Before classification, `build_face_intersection_graph` now provides the all-pairs discovery layer. It validates both operands, intersects every left/right face pair, records a status for every pair including disjoint pairs, and builds left/right adjacency lists for non-empty pairs. Supported analytic pairs reuse the NURBS SSI routines and carry trim-ready 3D/p-curve data; general current half-edge solids use a finite triangle-triangle fallback that emits line-segment curve records with p-curves projected onto each face support.
 
+`analyze_boolean_topology_merges` is the degeneracy-handling layer that sits beside the face-pair graph. It scans cross-operand vertices, edges, and faces with the Boolean tolerance and emits merge/contact records for coincident vertices, near-coincident edges, collinear edge overlaps, tangent point contacts, coplanar face overlaps, and nearly coincident face pairs. The pass is deliberately read-only: it gives the later shell rewrite enough information to sew or merge topology without corrupting the validated input solids.
+
 `heal_classified_split_faces` promotes the supported subset of those decisions into output geometry. For a boundary-to-boundary split on a polyline-trimmable face, it walks the outer trim boundary, builds the kept trim loop for the requested side, evaluates the loop back onto the analytic face, triangulates the healed region, runs tolerance-aware sewing, and tries to validate the result as a new half-edge `Solid`. If the regions are only a partial shell, the caller still receives the healed regions and mesh plus the topology validation error.
 
 ## GPU And Browser
