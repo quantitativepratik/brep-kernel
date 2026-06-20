@@ -84,6 +84,34 @@ pub enum TrimLoopOrientation {
     Uncertain,
 }
 
+/// Boundary side of a finite surface parameter domain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SurfaceBoundary {
+    /// Minimum U boundary.
+    UMin,
+    /// Maximum U boundary.
+    UMax,
+    /// Minimum V boundary.
+    VMin,
+    /// Maximum V boundary.
+    VMax,
+}
+
+/// Parameter-space metadata for a support surface.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SurfaceParameterization {
+    /// Finite U domain, when the support has one.
+    pub u_domain: Option<(f64, f64)>,
+    /// Finite V domain, when the support has one.
+    pub v_domain: Option<(f64, f64)>,
+    /// U period for periodic surfaces.
+    pub u_period: Option<f64>,
+    /// V period for periodic surfaces.
+    pub v_period: Option<f64>,
+    /// Collapsed parameter-domain boundaries.
+    pub singular_boundaries: Vec<SurfaceBoundary>,
+}
+
 /// Model-space curve carried by a topological edge.
 #[derive(Clone, Debug, PartialEq)]
 pub enum EdgeCurve3D {
@@ -236,6 +264,81 @@ pub enum FaceSurface {
 }
 
 impl FaceSurface {
+    /// Report finite domains, periodic directions, and singular boundaries.
+    pub fn parameterization(&self, tolerance: f64) -> SurfaceParameterization {
+        match self {
+            Self::Plane(_) | Self::Faceted => SurfaceParameterization {
+                u_domain: None,
+                v_domain: None,
+                u_period: None,
+                v_period: None,
+                singular_boundaries: Vec::new(),
+            },
+            Self::Cylinder(_) => SurfaceParameterization {
+                u_domain: Some((-core::f64::consts::PI, core::f64::consts::PI)),
+                v_domain: None,
+                u_period: Some(TWO_PI),
+                v_period: None,
+                singular_boundaries: Vec::new(),
+            },
+            Self::Nurbs(surface) => {
+                let ((u0, u1), (v0, v1)) = surface.domain();
+                let u_period = if nurbs_boundary_matches(
+                    surface,
+                    SurfaceBoundary::UMin,
+                    SurfaceBoundary::UMax,
+                    tolerance,
+                ) {
+                    Some(u1 - u0)
+                } else {
+                    None
+                };
+                let v_period = if nurbs_boundary_matches(
+                    surface,
+                    SurfaceBoundary::VMin,
+                    SurfaceBoundary::VMax,
+                    tolerance,
+                ) {
+                    Some(v1 - v0)
+                } else {
+                    None
+                };
+                SurfaceParameterization {
+                    u_domain: Some((u0, u1)),
+                    v_domain: Some((v0, v1)),
+                    u_period,
+                    v_period,
+                    singular_boundaries: nurbs_singular_boundaries(surface, tolerance),
+                }
+            }
+        }
+    }
+
+    /// Return the period for each parameter direction.
+    pub fn parameter_periods(&self, tolerance: f64) -> (Option<f64>, Option<f64>) {
+        let parameterization = self.parameterization(tolerance);
+        (parameterization.u_period, parameterization.v_period)
+    }
+
+    /// Return collapsed parameter-domain boundaries.
+    pub fn singular_boundaries(&self, tolerance: f64) -> Vec<SurfaceBoundary> {
+        self.parameterization(tolerance).singular_boundaries
+    }
+
+    /// Detect whether a UV location is singular for this support surface.
+    pub fn is_singular_at(&self, uv: Vec2, tolerance: f64) -> bool {
+        match self {
+            Self::Plane(_) | Self::Cylinder(_) | Self::Faceted => false,
+            Self::Nurbs(_) => {
+                let Some((du, dv)) = self.partials(uv) else {
+                    return false;
+                };
+                du.cross(dv).norm() <= tolerance
+                    || singular_boundary_at(self, uv, tolerance).is_some()
+            }
+        }
+    }
+
     /// Evaluate a point from the surface parameter domain when supported.
     pub fn evaluate(&self, uv: Vec2) -> Option<Point3> {
         match self {
@@ -251,7 +354,10 @@ impl FaceSurface {
                         uv.y,
                     ),
             ),
-            Self::Nurbs(surface) => Some(surface.evaluate(uv.x, uv.y)),
+            Self::Nurbs(surface) => {
+                let uv = constrain_nurbs_uv(surface, uv, DEFAULT_TRIM_TOLERANCE);
+                Some(surface.evaluate(uv.x, uv.y))
+            }
             Self::Faceted => None,
         }
     }
@@ -268,7 +374,10 @@ impl FaceSurface {
                 ),
                 Vec3::new(0.0, 0.0, 1.0),
             )),
-            Self::Nurbs(surface) => Some(surface.partials(uv.x, uv.y)),
+            Self::Nurbs(surface) => {
+                let uv = constrain_nurbs_uv(surface, uv, DEFAULT_TRIM_TOLERANCE);
+                Some(surface.partials(uv.x, uv.y))
+            }
             Self::Faceted => None,
         }
     }
@@ -323,7 +432,8 @@ impl FaceSurface {
             }
             Self::Cylinder(cylinder) => {
                 let d = point - cylinder.center;
-                Some(Vec2::new(d.y.atan2(d.x), d.z))
+                let angle = unwrap_periodic_value(d.y.atan2(d.x), seed.map(|uv| uv.x), TWO_PI);
+                Some(Vec2::new(angle, d.z))
             }
             Self::Nurbs(surface) => {
                 inverse_project_nurbs_with_seed(surface, point, seed, tolerance)
@@ -1082,6 +1192,7 @@ impl Solid {
             self.faces[face].trim_loops[loop_index].trims[trim_index].curve = pcurve;
             self.faces[face].trim_loops[loop_index].trims[trim_index].tolerance = tolerance;
         }
+        self.normalize_face_trim_loop_parameters(face, tolerance);
 
         if let Err(error) = self.validate_trim_topology() {
             self.faces[face].trim_loops = old_loops;
@@ -1487,7 +1598,9 @@ impl Solid {
                 .tolerance
                 .max(next_trim.tolerance)
                 .max(DEFAULT_TRIM_TOLERANCE);
-            if vec2_distance(end, next_start) > tolerance {
+            if surface_parameter_distance(&self.faces[face_id].surface, end, next_start, tolerance)
+                > tolerance
+            {
                 return Err(TopologyError::OpenTrimLoop(face_id, loop_index));
             }
         }
@@ -1566,8 +1679,22 @@ impl Solid {
         let end_uv = surface.project_point_near(end, uv_points.last().copied(), tolerance)?;
         *uv_points.first_mut()? = start_uv;
         *uv_points.last_mut()? = end_uv;
+        stabilize_singular_uv_samples(surface, &mut uv_points, tolerance);
+        unwrap_periodic_uv_samples(surface, &mut uv_points, tolerance);
+        if has_interior_singular_samples(surface, &uv_points, tolerance) {
+            return None;
+        }
+        let start_uv = *uv_points.first()?;
+        let end_uv = *uv_points.last()?;
         let pcurve = pcurve_from_uv_samples(&uv_points, tolerance)?;
         Some(trim_curve_with_endpoints(pcurve, start_uv, end_uv))
+    }
+
+    fn normalize_face_trim_loop_parameters(&mut self, face: FaceId, tolerance: f64) {
+        let surface = self.faces[face].surface.clone();
+        for trim_loop in &mut self.faces[face].trim_loops {
+            normalize_trim_loop_parameters(trim_loop, &surface, tolerance);
+        }
     }
 }
 
@@ -1581,6 +1708,7 @@ pub fn triangle_normal(points: &[Point3], tri: [usize; 3]) -> Vec3 {
 
 const DEFAULT_EDGE_TOLERANCE: f64 = 1.0e-9;
 const DEFAULT_TRIM_TOLERANCE: f64 = 1.0e-9;
+const TWO_PI: f64 = core::f64::consts::PI * 2.0;
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 const HASH_GRID: f64 = 1_000_000_000.0;
@@ -1619,6 +1747,112 @@ fn normalized_index(index: usize, samples: usize) -> f64 {
     }
 }
 
+fn nurbs_boundary_matches(
+    surface: &NurbsSurface,
+    a: SurfaceBoundary,
+    b: SurfaceBoundary,
+    tolerance: f64,
+) -> bool {
+    let ((u0, u1), (v0, v1)) = surface.domain();
+    for index in 0..=8 {
+        let t = index as f64 / 8.0;
+        let first = match a {
+            SurfaceBoundary::UMin => surface.evaluate(u0, lerp_scalar(v0, v1, t)),
+            SurfaceBoundary::UMax => surface.evaluate(u1, lerp_scalar(v0, v1, t)),
+            SurfaceBoundary::VMin => surface.evaluate(lerp_scalar(u0, u1, t), v0),
+            SurfaceBoundary::VMax => surface.evaluate(lerp_scalar(u0, u1, t), v1),
+        };
+        let second = match b {
+            SurfaceBoundary::UMin => surface.evaluate(u0, lerp_scalar(v0, v1, t)),
+            SurfaceBoundary::UMax => surface.evaluate(u1, lerp_scalar(v0, v1, t)),
+            SurfaceBoundary::VMin => surface.evaluate(lerp_scalar(u0, u1, t), v0),
+            SurfaceBoundary::VMax => surface.evaluate(lerp_scalar(u0, u1, t), v1),
+        };
+        if first.distance(second) > tolerance {
+            return false;
+        }
+    }
+    true
+}
+
+fn nurbs_singular_boundaries(surface: &NurbsSurface, tolerance: f64) -> Vec<SurfaceBoundary> {
+    let mut boundaries = Vec::new();
+    for boundary in [
+        SurfaceBoundary::UMin,
+        SurfaceBoundary::UMax,
+        SurfaceBoundary::VMin,
+        SurfaceBoundary::VMax,
+    ] {
+        if nurbs_boundary_is_collapsed(surface, boundary, tolerance) {
+            boundaries.push(boundary);
+        }
+    }
+    boundaries
+}
+
+fn nurbs_boundary_is_collapsed(
+    surface: &NurbsSurface,
+    boundary: SurfaceBoundary,
+    tolerance: f64,
+) -> bool {
+    let ((u0, u1), (v0, v1)) = surface.domain();
+    let reference = match boundary {
+        SurfaceBoundary::UMin => surface.evaluate(u0, v0),
+        SurfaceBoundary::UMax => surface.evaluate(u1, v0),
+        SurfaceBoundary::VMin => surface.evaluate(u0, v0),
+        SurfaceBoundary::VMax => surface.evaluate(u0, v1),
+    };
+    for index in 1..=8 {
+        let t = index as f64 / 8.0;
+        let point = match boundary {
+            SurfaceBoundary::UMin => surface.evaluate(u0, lerp_scalar(v0, v1, t)),
+            SurfaceBoundary::UMax => surface.evaluate(u1, lerp_scalar(v0, v1, t)),
+            SurfaceBoundary::VMin => surface.evaluate(lerp_scalar(u0, u1, t), v0),
+            SurfaceBoundary::VMax => surface.evaluate(lerp_scalar(u0, u1, t), v1),
+        };
+        if point.distance(reference) > tolerance {
+            return false;
+        }
+    }
+    true
+}
+
+fn singular_boundary_at(
+    surface: &FaceSurface,
+    uv: Vec2,
+    tolerance: f64,
+) -> Option<SurfaceBoundary> {
+    let parameterization = surface.parameterization(tolerance);
+    for boundary in &parameterization.singular_boundaries {
+        if uv_on_boundary(uv, *boundary, &parameterization, tolerance) {
+            return Some(*boundary);
+        }
+    }
+    None
+}
+
+fn uv_on_boundary(
+    uv: Vec2,
+    boundary: SurfaceBoundary,
+    parameterization: &SurfaceParameterization,
+    tolerance: f64,
+) -> bool {
+    match boundary {
+        SurfaceBoundary::UMin => parameterization
+            .u_domain
+            .is_some_and(|(u0, _)| (uv.x - u0).abs() <= tolerance),
+        SurfaceBoundary::UMax => parameterization
+            .u_domain
+            .is_some_and(|(_, u1)| (uv.x - u1).abs() <= tolerance),
+        SurfaceBoundary::VMin => parameterization
+            .v_domain
+            .is_some_and(|(v0, _)| (uv.y - v0).abs() <= tolerance),
+        SurfaceBoundary::VMax => parameterization
+            .v_domain
+            .is_some_and(|(_, v1)| (uv.y - v1).abs() <= tolerance),
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SurfaceProjection {
     uv: Vec2,
@@ -1631,6 +1865,7 @@ fn inverse_project_nurbs_with_seed(
     seed: Option<Vec2>,
     tolerance: f64,
 ) -> Option<Vec2> {
+    let seed = seed.map(|uv| constrain_nurbs_uv(surface, uv, tolerance));
     if let Some(seed) = seed {
         if let Some(projected) = refine_nurbs_projection(surface, point, seed, tolerance) {
             if projected.residual <= tolerance {
@@ -1654,16 +1889,22 @@ fn global_nurbs_projection(
     tolerance: f64,
 ) -> Option<SurfaceProjection> {
     let ((u0, u1), (v0, v1)) = surface.domain();
+    let (u_period, v_period) = nurbs_periods(surface, tolerance);
     let mut best = None;
     if let Some(seed) = seed {
-        best = refine_nurbs_projection(surface, point, clamp_uv(seed, u0, u1, v0, v1), tolerance);
+        best = refine_nurbs_projection(
+            surface,
+            point,
+            constrain_nurbs_uv(surface, seed, tolerance),
+            tolerance,
+        );
     }
     for j in 0..=4 {
         for i in 0..=4 {
             let u = lerp_scalar(u0, u1, i as f64 / 4.0);
             let v = lerp_scalar(v0, v1, j as f64 / 4.0);
             let candidate = refine_nurbs_projection(surface, point, Vec2::new(u, v), tolerance);
-            best = choose_projection(best, candidate, seed);
+            best = choose_projection(best, candidate, seed, u_period, v_period);
         }
     }
 
@@ -1674,6 +1915,8 @@ fn choose_projection(
     current: Option<SurfaceProjection>,
     candidate: Option<SurfaceProjection>,
     seed: Option<Vec2>,
+    u_period: Option<f64>,
+    v_period: Option<f64>,
 ) -> Option<SurfaceProjection> {
     let Some(candidate) = candidate else {
         return current;
@@ -1687,8 +1930,8 @@ fn choose_projection(
     }
     if residual_delta.abs() <= 1.0e-12 {
         if let Some(seed) = seed {
-            let current_distance = vec2_distance(current.uv, seed);
-            let candidate_distance = vec2_distance(candidate.uv, seed);
+            let current_distance = periodic_uv_distance(current.uv, seed, u_period, v_period);
+            let candidate_distance = periodic_uv_distance(candidate.uv, seed, u_period, v_period);
             if candidate_distance < current_distance {
                 return Some(candidate);
             }
@@ -1703,8 +1946,7 @@ fn refine_nurbs_projection(
     seed: Vec2,
     tolerance: f64,
 ) -> Option<SurfaceProjection> {
-    let ((u0, u1), (v0, v1)) = surface.domain();
-    let mut uv = clamp_uv(seed, u0, u1, v0, v1);
+    let mut uv = constrain_nurbs_uv(surface, seed, tolerance);
     let mut residual_norm = surface.evaluate(uv.x, uv.y).distance(point);
     if !residual_norm.is_finite() {
         return None;
@@ -1739,12 +1981,10 @@ fn refine_nurbs_projection(
         let mut accepted = None;
         let mut scale = 1.0;
         for _ in 0..8 {
-            let trial = clamp_uv(
+            let trial = constrain_nurbs_uv(
+                surface,
                 Vec2::new(uv.x + step_u * scale, uv.y + step_v * scale),
-                u0,
-                u1,
-                v0,
-                v1,
+                tolerance,
             );
             let trial_residual = surface.evaluate(trial.x, trial.y).distance(point);
             if trial_residual.is_finite() && trial_residual < residual_norm {
@@ -1770,8 +2010,83 @@ fn refine_nurbs_projection(
     })
 }
 
-fn clamp_uv(uv: Vec2, u0: f64, u1: f64, v0: f64, v1: f64) -> Vec2 {
-    Vec2::new(uv.x.clamp(u0, u1), uv.y.clamp(v0, v1))
+fn constrain_nurbs_uv(surface: &NurbsSurface, uv: Vec2, tolerance: f64) -> Vec2 {
+    let ((u0, u1), (v0, v1)) = surface.domain();
+    let (u_period, v_period) = nurbs_periods(surface, tolerance);
+    Vec2::new(
+        match u_period {
+            Some(period) => wrap_to_periodic_domain(uv.x, u0, u1, period, tolerance),
+            None => uv.x.clamp(u0, u1),
+        },
+        match v_period {
+            Some(period) => wrap_to_periodic_domain(uv.y, v0, v1, period, tolerance),
+            None => uv.y.clamp(v0, v1),
+        },
+    )
+}
+
+fn nurbs_periods(surface: &NurbsSurface, tolerance: f64) -> (Option<f64>, Option<f64>) {
+    let ((u0, u1), (v0, v1)) = surface.domain();
+    let u_period = if nurbs_boundary_matches(
+        surface,
+        SurfaceBoundary::UMin,
+        SurfaceBoundary::UMax,
+        tolerance,
+    ) {
+        Some(u1 - u0)
+    } else {
+        None
+    };
+    let v_period = if nurbs_boundary_matches(
+        surface,
+        SurfaceBoundary::VMin,
+        SurfaceBoundary::VMax,
+        tolerance,
+    ) {
+        Some(v1 - v0)
+    } else {
+        None
+    };
+    (u_period, v_period)
+}
+
+fn wrap_to_periodic_domain(value: f64, min: f64, max: f64, period: f64, tolerance: f64) -> f64 {
+    if (value - max).abs() <= tolerance {
+        return max;
+    }
+    min + (value - min).rem_euclid(period)
+}
+
+fn unwrap_periodic_value(value: f64, seed: Option<f64>, period: f64) -> f64 {
+    match seed {
+        Some(seed) => value + ((seed - value) / period).round() * period,
+        None => value,
+    }
+}
+
+fn unwrap_uv_near(uv: Vec2, seed: Vec2, u_period: Option<f64>, v_period: Option<f64>) -> Vec2 {
+    Vec2::new(
+        match u_period {
+            Some(period) => unwrap_periodic_value(uv.x, Some(seed.x), period),
+            None => uv.x,
+        },
+        match v_period {
+            Some(period) => unwrap_periodic_value(uv.y, Some(seed.y), period),
+            None => uv.y,
+        },
+    )
+}
+
+fn periodic_uv_distance(a: Vec2, b: Vec2, u_period: Option<f64>, v_period: Option<f64>) -> f64 {
+    let dx = match u_period {
+        Some(period) => unwrap_periodic_value(a.x, Some(b.x), period) - b.x,
+        None => a.x - b.x,
+    };
+    let dy = match v_period {
+        Some(period) => unwrap_periodic_value(a.y, Some(b.y), period) - b.y,
+        None => a.y - b.y,
+    };
+    dx.hypot(dy)
 }
 
 fn edge_curve_has_span(curve: &EdgeCurve3D, tolerance: f64) -> bool {
@@ -1827,11 +2142,142 @@ fn project_model_points_to_surface(
     let mut uv_points = Vec::with_capacity(model_points.len());
     let mut seed = None;
     for point in model_points {
-        let uv = surface.project_point_near(*point, seed, tolerance)?;
+        let mut uv = surface.project_point_near(*point, seed, tolerance)?;
+        if let Some(previous) = uv_points.last().copied() {
+            let (u_period, v_period) = surface.parameter_periods(tolerance);
+            uv = unwrap_uv_near(uv, previous, u_period, v_period);
+        }
         uv_points.push(uv);
         seed = Some(uv);
     }
+    stabilize_singular_uv_samples(surface, &mut uv_points, tolerance);
+    unwrap_periodic_uv_samples(surface, &mut uv_points, tolerance);
+    if has_interior_singular_samples(surface, &uv_points, tolerance) {
+        return None;
+    }
     Some(uv_points)
+}
+
+fn surface_parameter_distance(surface: &FaceSurface, a: Vec2, b: Vec2, tolerance: f64) -> f64 {
+    if singular_parameter_equivalent(surface, a, b, tolerance) {
+        return 0.0;
+    }
+    let (u_period, v_period) = surface.parameter_periods(tolerance);
+    periodic_uv_distance(a, b, u_period, v_period)
+}
+
+fn singular_parameter_equivalent(surface: &FaceSurface, a: Vec2, b: Vec2, tolerance: f64) -> bool {
+    let parameterization = surface.parameterization(tolerance);
+    parameterization.singular_boundaries.iter().any(|boundary| {
+        uv_on_boundary(a, *boundary, &parameterization, tolerance)
+            && uv_on_boundary(b, *boundary, &parameterization, tolerance)
+    })
+}
+
+fn unwrap_periodic_uv_samples(surface: &FaceSurface, points: &mut [Vec2], tolerance: f64) {
+    let (u_period, v_period) = surface.parameter_periods(tolerance);
+    for index in 1..points.len() {
+        points[index] = unwrap_uv_near(points[index], points[index - 1], u_period, v_period);
+    }
+}
+
+fn stabilize_singular_uv_samples(surface: &FaceSurface, points: &mut [Vec2], tolerance: f64) {
+    if points.len() < 2 {
+        return;
+    }
+    for index in 0..points.len() {
+        let neighbor = if index == 0 {
+            points[1]
+        } else {
+            points[index - 1]
+        };
+        points[index] = stabilize_singular_uv(surface, points[index], neighbor, tolerance);
+    }
+}
+
+fn stabilize_singular_uv(
+    surface: &FaceSurface,
+    mut uv: Vec2,
+    neighbor: Vec2,
+    tolerance: f64,
+) -> Vec2 {
+    let Some(boundary) = singular_boundary_at(surface, uv, tolerance) else {
+        return uv;
+    };
+    match boundary {
+        SurfaceBoundary::UMin | SurfaceBoundary::UMax => uv.y = neighbor.y,
+        SurfaceBoundary::VMin | SurfaceBoundary::VMax => uv.x = neighbor.x,
+    }
+    uv
+}
+
+fn has_interior_singular_samples(surface: &FaceSurface, points: &[Vec2], tolerance: f64) -> bool {
+    points.len() > 2
+        && points[1..points.len() - 1]
+            .iter()
+            .any(|uv| surface.is_singular_at(*uv, tolerance))
+}
+
+fn normalize_trim_loop_parameters(trim_loop: &mut TrimLoop, surface: &FaceSurface, tolerance: f64) {
+    if trim_loop.trims.len() < 2 {
+        return;
+    }
+    let (u_period, v_period) = surface.parameter_periods(tolerance);
+    if u_period.is_none() && v_period.is_none() {
+        return;
+    }
+    for index in 1..trim_loop.trims.len() {
+        let Some((_, previous_end)) = trim_loop.trims[index - 1].curve.endpoints() else {
+            continue;
+        };
+        let Some((start, _)) = trim_loop.trims[index].curve.endpoints() else {
+            continue;
+        };
+        let offset = periodic_offset_to_near(start, previous_end, u_period, v_period);
+        if offset.x.abs() > tolerance || offset.y.abs() > tolerance {
+            translate_trim_curve(&mut trim_loop.trims[index].curve, offset);
+        }
+    }
+}
+
+fn periodic_offset_to_near(
+    value: Vec2,
+    target: Vec2,
+    u_period: Option<f64>,
+    v_period: Option<f64>,
+) -> Vec2 {
+    Vec2::new(
+        u_period
+            .map(|period| ((target.x - value.x) / period).round() * period)
+            .unwrap_or(0.0),
+        v_period
+            .map(|period| ((target.y - value.y) / period).round() * period)
+            .unwrap_or(0.0),
+    )
+}
+
+fn translate_trim_curve(curve: &mut TrimCurve2D, offset: Vec2) {
+    match curve {
+        TrimCurve2D::LineSegment { start, end } => {
+            *start = *start + offset;
+            *end = *end + offset;
+        }
+        TrimCurve2D::CircularArc { center, .. } => {
+            *center = *center + offset;
+        }
+        TrimCurve2D::Polyline { points } => {
+            for point in points {
+                *point = *point + offset;
+            }
+        }
+        TrimCurve2D::Nurbs(curve) => {
+            for point in &mut curve.control_points {
+                point.x += offset.x;
+                point.y += offset.y;
+            }
+        }
+        TrimCurve2D::Unresolved => {}
+    }
 }
 
 fn compact_uv_samples(points: &[Vec2], tolerance: f64) -> Vec<Vec2> {

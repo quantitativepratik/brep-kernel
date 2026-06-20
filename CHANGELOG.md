@@ -8,6 +8,7 @@ Initial public prototype:
 - analytic face support and trim-loop topology
 - 3D edge curves plus per-face 2D p-curves
 - robust trim-loop orientation/nesting analysis and NURBS p-curve generation
+- periodic seam unwrapping and singular surface-boundary handling for p-curves
 - staged face splitting from trim-ready SSI curves
 - Boolean classification over staged split faces
 - healed Boolean trim-region generation for supported split faces

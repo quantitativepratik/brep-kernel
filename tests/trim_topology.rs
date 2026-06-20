@@ -1,8 +1,9 @@
+use brep_kernel::geometry::Cylinder;
 use brep_kernel::math::{Point3, Vec2};
 use brep_kernel::nurbs::{NurbsCurve, NurbsSurface};
 use brep_kernel::topology::{
-    EdgeCurve3D, FaceSurface, Solid, TopologyError, Trim, TrimCurve2D, TrimLoop, TrimLoopKind,
-    TrimLoopOrientation,
+    EdgeCurve3D, FaceSurface, Solid, SurfaceBoundary, TopologyError, Trim, TrimCurve2D, TrimLoop,
+    TrimLoopKind, TrimLoopOrientation,
 };
 
 #[test]
@@ -260,6 +261,89 @@ fn pcurve_generation_rejects_edges_that_leave_nurbs_surface() {
     assert_eq!(cube.faces[0].trim_loops, original_trim);
 }
 
+#[test]
+fn cylinder_pcurve_generation_unwraps_periodic_seam() {
+    let mut solid = seam_tetrahedron();
+    solid
+        .set_face_surface(
+            0,
+            FaceSurface::Cylinder(Cylinder::z(Point3::ZERO, 1.0, 2.0)),
+        )
+        .unwrap();
+
+    let face_halfedges: Vec<_> = solid.faces[0].trim_loops[0]
+        .trims
+        .iter()
+        .map(|trim| trim.halfedge.unwrap())
+        .collect();
+    for halfedge in face_halfedges {
+        let start = solid.vertices[solid.halfedges[halfedge].origin].point;
+        let end = solid.vertices[solid.halfedges[solid.halfedges[halfedge].next].origin].point;
+        let start_angle = start.y.atan2(start.x);
+        let end_angle = unwrap_angle(end.y.atan2(end.x), start_angle);
+        let points = (0..9)
+            .map(|index| {
+                let t = index as f64 / 8.0;
+                cylinder_point(start_angle * (1.0 - t) + end_angle * t)
+            })
+            .collect();
+        let edge = solid.halfedges[halfedge].edge;
+        solid
+            .set_edge_curve(edge, EdgeCurve3D::Polyline { points }, 1.0e-8)
+            .unwrap();
+    }
+
+    solid.generate_face_pcurves(0, 9, 1.0e-8).unwrap();
+
+    let first_trim_points = solid.faces[0].trim_loops[0].trims[0]
+        .curve
+        .sample_points(9)
+        .unwrap();
+    for window in first_trim_points.windows(2) {
+        assert!((window[1].x - window[0].x).abs() < core::f64::consts::PI);
+    }
+    solid.validate_trim_topology().unwrap();
+}
+
+#[test]
+fn singular_nurbs_endpoint_uses_adjacent_parameter() {
+    let mut solid = singular_tetrahedron();
+    solid
+        .set_face_surface(0, FaceSurface::Nurbs(Box::new(singular_cap_surface())))
+        .unwrap();
+
+    assert_eq!(
+        solid.faces[0].surface.singular_boundaries(1.0e-8),
+        vec![SurfaceBoundary::VMin]
+    );
+    assert!(solid.faces[0]
+        .surface
+        .is_singular_at(Vec2::new(0.5, 0.0), 1.0e-8));
+
+    let face_halfedges: Vec<_> = solid.faces[0].trim_loops[0]
+        .trims
+        .iter()
+        .map(|trim| trim.halfedge.unwrap())
+        .collect();
+    for halfedge in face_halfedges {
+        let start = solid.vertices[solid.halfedges[halfedge].origin].point;
+        let end = solid.vertices[solid.halfedges[solid.halfedges[halfedge].next].origin].point;
+        let edge = solid.halfedges[halfedge].edge;
+        solid
+            .set_edge_curve(edge, EdgeCurve3D::line_segment(start, end), 1.0e-8)
+            .unwrap();
+    }
+
+    solid.generate_face_pcurves(0, 9, 1.0e-8).unwrap();
+
+    let trims = &solid.faces[0].trim_loops[0].trims;
+    let first_edge = trims[0].curve.sample_points(5).unwrap();
+    let last_edge = trims[2].curve.sample_points(5).unwrap();
+    assert!(vec2_close(first_edge[0], Vec2::new(0.0, 0.0), 1.0e-6));
+    assert!(vec2_close(last_edge[4], Vec2::new(1.0, 0.0), 1.0e-6));
+    solid.validate_trim_topology().unwrap();
+}
+
 fn square_loop(kind: TrimLoopKind, points: [Vec2; 4]) -> TrimLoop {
     TrimLoop::new(
         kind,
@@ -274,6 +358,37 @@ fn square_loop(kind: TrimLoopKind, points: [Vec2; 4]) -> TrimLoop {
 
 fn line(start: Vec2, end: Vec2) -> Trim {
     Trim::curve(TrimCurve2D::LineSegment { start, end }, 1.0e-9)
+}
+
+fn seam_tetrahedron() -> Solid {
+    let points = vec![
+        cylinder_point(2.8),
+        cylinder_point(-2.8),
+        cylinder_point(-2.4),
+        Point3::new(0.0, 0.0, 1.0),
+    ];
+    tetrahedron(points)
+}
+
+fn singular_tetrahedron() -> Solid {
+    tetrahedron(vec![
+        Point3::new(0.0, 0.0, 1.0),
+        Point3::new(1.0, 0.0, 0.0),
+        Point3::new(0.0, 1.0, 0.0),
+        Point3::new(0.0, 0.0, -1.0),
+    ])
+}
+
+fn tetrahedron(points: Vec<Point3>) -> Solid {
+    Solid::from_triangle_mesh(points, &[[0, 1, 2], [0, 3, 1], [1, 3, 2], [2, 3, 0]]).unwrap()
+}
+
+fn cylinder_point(angle: f64) -> Point3 {
+    Point3::new(angle.cos(), angle.sin(), 0.0)
+}
+
+fn unwrap_angle(angle: f64, seed: f64) -> f64 {
+    angle + ((seed - angle) / (core::f64::consts::PI * 2.0)).round() * core::f64::consts::PI * 2.0
 }
 
 fn curved_quadratic_surface(u_bulge: f64, v_bulge: f64) -> NurbsSurface {
@@ -348,6 +463,26 @@ fn boundary_curve_on_curved_surface(
 
 fn uv_to_xy_point(uv: Vec2, z: f64) -> Point3 {
     Point3::new(-1.0 + 2.0 * uv.x, -1.0 + 2.0 * uv.y, z)
+}
+
+fn singular_cap_surface() -> NurbsSurface {
+    let pole = Point3::new(0.0, 0.0, 1.0);
+    NurbsSurface::new(
+        1,
+        1,
+        vec![0.0, 0.0, 1.0, 1.0],
+        vec![0.0, 0.0, 1.0, 1.0],
+        2,
+        2,
+        vec![
+            pole,
+            pole,
+            Point3::new(1.0, 0.0, 0.0),
+            Point3::new(0.0, 1.0, 0.0),
+        ],
+        vec![1.0; 4],
+    )
+    .unwrap()
 }
 
 fn vec2_close(a: Vec2, b: Vec2, tolerance: f64) -> bool {
