@@ -9,6 +9,7 @@ Initial public prototype:
 - 3D edge curves plus per-face 2D p-curves
 - robust trim-loop orientation/nesting analysis and NURBS p-curve generation
 - periodic seam unwrapping and singular surface-boundary handling for p-curves
+- topology-level tolerance-aware triangle mesh sewing with deterministic reports
 - staged face splitting from trim-ready SSI curves
 - Boolean classification over staged split faces
 - healed Boolean trim-region generation for supported split faces

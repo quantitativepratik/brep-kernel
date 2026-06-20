@@ -18,7 +18,7 @@ That behavior is intentionally conservative. An industrial kernel would normally
 - Shewchuk-style adaptive expansion arithmetic for exact signs of floating inputs.
 - Rational arithmetic for CAD data that originates in exact construction history.
 - Symbolic perturbation to force consistent decisions across a whole arrangement.
-- Topology-aware healing that merges entities inside a model tolerance after certified classification.
+- Broader topology-aware healing that merges analytic edges, vertices, and trim loops inside a model tolerance after certified classification. The current topology layer includes tolerance-aware triangle mesh sewing for shell candidates, but not yet full analytic edge/trim sewing.
 
 The important rule is that uncertain signs must remain explicit. They are not ordinary negative or positive signs with a smaller epsilon.
 

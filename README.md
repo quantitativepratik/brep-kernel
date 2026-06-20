@@ -31,6 +31,7 @@ Then open `http://localhost:8080/web/`.
 
 - Half-edge topology for closed manifold triangle B-reps: vertices, half-edges, edges, faces, shells, solids, Euler/genus validation, signed volume.
 - Edge and face geometry: `EdgeCurve3D` model-space curves on topological edges, `FaceSurface` support surfaces, outer/inner `TrimLoop`s with per-face 2D p-curves, trim-loop orientation/nesting analysis, seeded NURBS-surface p-curve generation, periodic seam unwrapping, and singular-boundary handling.
+- Tolerance-aware sewing: clusters near-coincident mesh vertices, removes triangles collapsed by sewing, reports the vertex remap, and validates the sewn mesh as half-edge topology.
 - Euler construction operators: `MVFS`, `MEV`, and `MEF`, with count invariants and conversion into validated half-edge solids.
 - Analytic primitives: lines, planes, circles, boxes, cylinders.
 - NURBS curves and surfaces: clamped/nonuniform knot vectors, rational evaluation, first derivatives, surface normals, curve knot insertion, and global curve interpolation.
@@ -49,7 +50,7 @@ Then open `http://localhost:8080/web/`.
   - maps split sides to Union/Intersect/Subtract keep, discard, and reversed-keep actions
 - Healed Boolean output:
   - promotes supported classified split sides into new trim loops
-  - triangulates healed regions and validates a new half-edge solid when the generated shell closes
+  - triangulates healed regions, runs tolerance-aware sewing, and validates a new half-edge solid when the generated shell closes
 - Boolean operation:
   - cube minus Z-cylinder as a validated genus-1 half-edge solid
 - Thin parametric feature layer:

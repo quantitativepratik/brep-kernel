@@ -722,6 +722,38 @@ pub struct TopologyCounts {
     pub boundary_halfedges: usize,
 }
 
+/// Deterministic report from tolerance-aware mesh sewing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SewingReport {
+    /// Sewing tolerance in model units.
+    pub tolerance: f64,
+    /// Number of input vertices.
+    pub input_vertices: usize,
+    /// Number of input triangles.
+    pub input_triangles: usize,
+    /// Number of vertices after tolerance clustering.
+    pub output_vertices: usize,
+    /// Number of triangles after removing collapsed faces.
+    pub output_triangles: usize,
+    /// Number of vertices merged into earlier tolerance clusters.
+    pub merged_vertices: usize,
+    /// Number of triangles removed because sewing collapsed at least two corners together.
+    pub removed_degenerate_triangles: usize,
+    /// Map from each input vertex index to the sewn output vertex index.
+    pub vertex_map: Vec<VertexId>,
+}
+
+/// Triangle mesh after tolerance-aware sewing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SewnTriangleMesh {
+    /// Sewn model-space vertices.
+    pub vertices: Vec<Point3>,
+    /// Triangles rewritten through the sewn vertex map.
+    pub triangles: Vec<[usize; 3]>,
+    /// Deterministic sewing diagnostics.
+    pub report: SewingReport,
+}
+
 /// One trim-loop record in a face nesting analysis.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TrimLoopNesting {
@@ -766,8 +798,14 @@ pub struct SplitFacesReport {
 /// Topology construction or validation error.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TopologyError {
+    /// A vertex id or vertex coordinate is invalid.
+    InvalidVertex(VertexId),
     /// A face does not contain three distinct vertices.
     DegenerateTriangle(usize),
+    /// Sewing tolerance is not finite and nonnegative.
+    InvalidSewingTolerance,
+    /// Sewing removed every triangle or left no usable shell candidate.
+    DegenerateSewnMesh,
     /// The same directed edge appears more than once.
     DuplicateDirectedEdge(VertexId, VertexId),
     /// More or fewer than two faces use an undirected edge.
@@ -811,6 +849,110 @@ pub enum TopologyError {
 }
 
 impl Solid {
+    /// Sew a triangle mesh by clustering vertices within `tolerance`.
+    ///
+    /// The returned triangles are rewritten through the sewn vertex map.
+    /// Triangles that collapse to fewer than three distinct sewn vertices are
+    /// removed and counted in the report. This does not require the result to
+    /// be a closed manifold; use [`Solid::from_triangle_mesh_sewn`] when a
+    /// validated B-rep shell is required.
+    pub fn sew_triangle_mesh(
+        points: Vec<Point3>,
+        triangles: &[[usize; 3]],
+        tolerance: f64,
+    ) -> Result<SewnTriangleMesh, TopologyError> {
+        if !tolerance.is_finite() || tolerance < 0.0 {
+            return Err(TopologyError::InvalidSewingTolerance);
+        }
+        for (index, point) in points.iter().enumerate() {
+            if !finite_point3(*point) {
+                return Err(TopologyError::InvalidVertex(index));
+            }
+        }
+
+        let mut sets = DisjointSets::new(points.len());
+        for i in 0..points.len() {
+            for j in (i + 1)..points.len() {
+                if points[i].distance(points[j]) <= tolerance {
+                    sets.union(i, j);
+                }
+            }
+        }
+
+        let mut root_to_output = HashMap::<usize, usize>::new();
+        let mut vertex_map = vec![0; points.len()];
+        let mut sums = Vec::<Point3>::new();
+        let mut counts = Vec::<usize>::new();
+        for (index, point) in points.iter().copied().enumerate() {
+            let root = sets.find(index);
+            let output = *root_to_output.entry(root).or_insert_with(|| {
+                sums.push(Point3::ZERO);
+                counts.push(0);
+                sums.len() - 1
+            });
+            vertex_map[index] = output;
+            sums[output] += point;
+            counts[output] += 1;
+        }
+
+        let sewn_points: Vec<Point3> = sums
+            .into_iter()
+            .zip(counts.iter().copied())
+            .map(|(sum, count)| sum / count as f64)
+            .collect();
+
+        let mut sewn_triangles = Vec::<[usize; 3]>::new();
+        let mut removed_degenerate_triangles = 0;
+        for tri in triangles.iter().copied() {
+            for vertex in tri {
+                if vertex >= vertex_map.len() {
+                    return Err(TopologyError::InvalidVertex(vertex));
+                }
+            }
+            let sewn = [vertex_map[tri[0]], vertex_map[tri[1]], vertex_map[tri[2]]];
+            if sewn[0] == sewn[1] || sewn[1] == sewn[2] || sewn[2] == sewn[0] {
+                removed_degenerate_triangles += 1;
+            } else {
+                sewn_triangles.push(sewn);
+            }
+        }
+
+        let report = SewingReport {
+            tolerance,
+            input_vertices: points.len(),
+            input_triangles: triangles.len(),
+            output_vertices: sewn_points.len(),
+            output_triangles: sewn_triangles.len(),
+            merged_vertices: points.len().saturating_sub(sewn_points.len()),
+            removed_degenerate_triangles,
+            vertex_map,
+        };
+        Ok(SewnTriangleMesh {
+            vertices: sewn_points,
+            triangles: sewn_triangles,
+            report,
+        })
+    }
+
+    /// Sew a triangle mesh with tolerance and validate the result as a B-rep solid.
+    pub fn from_triangle_mesh_sewn(
+        points: Vec<Point3>,
+        triangles: &[[usize; 3]],
+        tolerance: f64,
+    ) -> Result<(Self, SewingReport), TopologyError> {
+        let sewn = Self::sew_triangle_mesh(points, triangles, tolerance)?;
+        if sewn.triangles.is_empty() {
+            return Err(TopologyError::DegenerateSewnMesh);
+        }
+        let mut solid = Self::from_triangle_mesh(sewn.vertices, &sewn.triangles)?;
+        let edge_tolerance = tolerance.max(DEFAULT_EDGE_TOLERANCE);
+        for edge in &mut solid.edges {
+            edge.tolerance = edge_tolerance;
+        }
+        solid.validate()?;
+        Ok((solid, sewn.report))
+    }
+
     /// Construct a closed half-edge solid from an indexed triangle mesh.
     pub fn from_triangle_mesh(
         points: Vec<Point3>,
@@ -823,11 +965,21 @@ impl Solid {
                 halfedge: None,
             })
             .collect();
+        for (index, vertex) in vertices.iter().enumerate() {
+            if !finite_point3(vertex.point) {
+                return Err(TopologyError::InvalidVertex(index));
+            }
+        }
         let mut halfedges = Vec::<HalfEdge>::new();
         let mut faces = Vec::<Face>::new();
         let mut directed = HashMap::<(usize, usize), HalfEdgeId>::new();
 
         for (face_id, tri) in triangles.iter().copied().enumerate() {
+            for vertex in tri {
+                if vertex >= vertices.len() {
+                    return Err(TopologyError::InvalidVertex(vertex));
+                }
+            }
             if tri[0] == tri[1] || tri[1] == tri[2] || tri[2] == tri[0] {
                 return Err(TopologyError::DegenerateTriangle(face_id));
             }
@@ -1718,6 +1870,45 @@ enum LoopPointLocation {
     Inside,
     Boundary,
     Outside,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DisjointSets {
+    parent: Vec<usize>,
+    rank: Vec<u8>,
+}
+
+impl DisjointSets {
+    fn new(size: usize) -> Self {
+        Self {
+            parent: (0..size).collect(),
+            rank: vec![0; size],
+        }
+    }
+
+    fn find(&mut self, index: usize) -> usize {
+        let parent = self.parent[index];
+        if parent != index {
+            let root = self.find(parent);
+            self.parent[index] = root;
+        }
+        self.parent[index]
+    }
+
+    fn union(&mut self, a: usize, b: usize) {
+        let mut a_root = self.find(a);
+        let mut b_root = self.find(b);
+        if a_root == b_root {
+            return;
+        }
+        if self.rank[a_root] < self.rank[b_root] {
+            core::mem::swap(&mut a_root, &mut b_root);
+        }
+        self.parent[b_root] = a_root;
+        if self.rank[a_root] == self.rank[b_root] {
+            self.rank[a_root] += 1;
+        }
+    }
 }
 
 fn plane_frame(plane: Plane) -> (Vec3, Vec3) {

@@ -82,6 +82,7 @@ fn healing_promotes_boundary_split_sides_to_trim_regions_and_mesh() {
     assert!(!healed.mesh.vertices.is_empty());
     assert!(healed.solid.is_none());
     assert!(healed.solid_error.is_some());
+    assert!(healed.sewing_report.is_some());
 }
 
 #[test]

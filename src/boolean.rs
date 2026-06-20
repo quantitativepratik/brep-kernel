@@ -8,7 +8,9 @@
 //! shell topology.
 
 use crate::math::{Point3, Vec2, Vec3};
-use crate::topology::{FaceId, Solid, SplitEdgeId, TopologyError, TrimCurve2D, TrimLoopKind};
+use crate::topology::{
+    FaceId, SewingReport, Solid, SplitEdgeId, TopologyError, TrimCurve2D, TrimLoopKind,
+};
 
 /// Boolean operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -181,6 +183,8 @@ pub struct HealedBooleanOutput {
     pub solid: Option<Solid>,
     /// Validation error when the healed mesh is only a partial/open shell.
     pub solid_error: Option<TopologyError>,
+    /// Tolerance-aware sewing report for the healed mesh, when meshing ran.
+    pub sewing_report: Option<SewingReport>,
 }
 
 /// Boolean error.
@@ -313,12 +317,33 @@ pub fn heal_classified_split_faces(
         push_healed_regions_for_face(solid, &split.b, tolerance, &mut regions)?;
     }
     let mesh = triangulate_healed_regions(&regions, tolerance)?;
-    let (solid, solid_error) = if mesh.triangles.is_empty() {
-        (None, None)
+    let (solid, solid_error, sewing_report) = if mesh.triangles.is_empty() {
+        (None, None, None)
     } else {
-        match Solid::from_triangle_mesh(mesh.vertices.clone(), &mesh.triangles) {
-            Ok(solid) => (Some(solid), None),
-            Err(error) => (None, Some(error)),
+        match Solid::sew_triangle_mesh(mesh.vertices.clone(), &mesh.triangles, tolerance) {
+            Ok(sewn) => {
+                if sewn.triangles.is_empty() {
+                    (
+                        None,
+                        Some(TopologyError::DegenerateSewnMesh),
+                        Some(sewn.report),
+                    )
+                } else {
+                    let sewn_vertices = sewn.vertices;
+                    let sewn_triangles = sewn.triangles;
+                    let report = sewn.report;
+                    match Solid::from_triangle_mesh(sewn_vertices, &sewn_triangles) {
+                        Ok(mut solid) => {
+                            for edge in &mut solid.edges {
+                                edge.tolerance = tolerance;
+                            }
+                            (Some(solid), None, Some(report))
+                        }
+                        Err(error) => (None, Some(error), Some(report)),
+                    }
+                }
+            }
+            Err(error) => (None, Some(error), None),
         }
     };
     Ok(HealedBooleanOutput {
@@ -327,6 +352,7 @@ pub fn heal_classified_split_faces(
         mesh,
         solid,
         solid_error,
+        sewing_report,
     })
 }
 
