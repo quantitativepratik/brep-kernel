@@ -230,6 +230,52 @@ pub struct HealedTriangleMesh {
     pub triangles: Vec<[usize; 3]>,
 }
 
+/// Report from tolerance-aware Boolean mesh healing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BooleanMeshHealingReport {
+    /// Healing tolerance in model units.
+    pub tolerance: f64,
+    /// Number of input vertices.
+    pub input_vertices: usize,
+    /// Number of input triangles.
+    pub input_triangles: usize,
+    /// Number of vertices after gap-closing sewing.
+    pub sewn_vertices: usize,
+    /// Number of triangles after sewing collapsed degenerate faces.
+    pub sewn_triangles: usize,
+    /// Number of output vertices after compaction.
+    pub output_vertices: usize,
+    /// Number of output triangles after all filtering.
+    pub output_triangles: usize,
+    /// Number of input vertices merged by tolerance sewing.
+    pub merged_vertices: usize,
+    /// Triangles removed because sewing collapsed two or more corners.
+    pub removed_degenerate_triangles: usize,
+    /// Triangles removed because they contain an edge at or below tolerance.
+    pub removed_tiny_edge_triangles: usize,
+    /// Triangles removed because they are numerically skinny or near zero-area.
+    pub removed_sliver_triangles: usize,
+    /// Duplicate or reversed duplicate triangles removed after filtering.
+    pub removed_duplicate_triangles: usize,
+    /// True when the healed mesh validated as a closed half-edge solid.
+    pub manifold: bool,
+    /// Topology validation error when the healed mesh is still not a valid manifold.
+    pub solid_error: Option<TopologyError>,
+    /// Underlying vertex-clustering/sewing diagnostics.
+    pub sewing_report: SewingReport,
+}
+
+/// Output from healing a raw Boolean triangle mesh.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BooleanMeshHealingOutput {
+    /// Healed and compacted triangle mesh.
+    pub mesh: HealedTriangleMesh,
+    /// Valid closed half-edge solid when manifold validation succeeds.
+    pub solid: Option<Solid>,
+    /// Healing diagnostics.
+    pub report: BooleanMeshHealingReport,
+}
+
 /// Output from promoting classified split faces into healed regions.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HealedBooleanOutput {
@@ -747,6 +793,66 @@ pub fn classify_boolean_regions(
     })
 }
 
+/// Heal a raw Boolean triangle mesh by closing gaps, removing slivers/tiny edges,
+/// and validating manifoldness.
+///
+/// The function is intentionally conservative. It performs tolerance sewing,
+/// removes collapsed, tiny-edge, skinny, and duplicate triangles, compacts the
+/// remaining mesh, then attempts to build a closed half-edge [`Solid`]. When
+/// validation fails, the repaired mesh and the topology error are still returned
+/// so callers can inspect why an arbitrary input could not be made manifold.
+pub fn heal_boolean_triangle_mesh(
+    vertices: Vec<Point3>,
+    triangles: &[[usize; 3]],
+    tolerance: f64,
+) -> Result<BooleanMeshHealingOutput, BooleanError> {
+    if !tolerance.is_finite() || tolerance < 0.0 {
+        return Err(BooleanError::InvalidInput("tolerance must be nonnegative"));
+    }
+    let tolerance = tolerance.max(1.0e-9);
+    let input_vertices = vertices.len();
+    let input_triangles = triangles.len();
+    let sewn = Solid::sew_triangle_mesh(vertices, triangles, tolerance)?;
+    let sewing_report = sewn.report.clone();
+    let filter = filter_boolean_triangles(&sewn.vertices, &sewn.triangles, tolerance);
+    let mesh = compact_triangle_mesh(sewn.vertices, &filter.triangles);
+    let (solid, solid_error) = if mesh.triangles.is_empty() {
+        (None, None)
+    } else {
+        match Solid::from_triangle_mesh(mesh.vertices.clone(), &mesh.triangles) {
+            Ok(mut solid) => {
+                for edge in &mut solid.edges {
+                    edge.tolerance = tolerance;
+                }
+                (Some(solid), None)
+            }
+            Err(error) => (None, Some(error)),
+        }
+    };
+
+    Ok(BooleanMeshHealingOutput {
+        report: BooleanMeshHealingReport {
+            tolerance,
+            input_vertices,
+            input_triangles,
+            sewn_vertices: sewing_report.output_vertices,
+            sewn_triangles: sewing_report.output_triangles,
+            output_vertices: mesh.vertices.len(),
+            output_triangles: mesh.triangles.len(),
+            merged_vertices: sewing_report.merged_vertices,
+            removed_degenerate_triangles: sewing_report.removed_degenerate_triangles,
+            removed_tiny_edge_triangles: filter.removed_tiny_edge_triangles,
+            removed_sliver_triangles: filter.removed_sliver_triangles,
+            removed_duplicate_triangles: filter.removed_duplicate_triangles,
+            manifold: solid.is_some(),
+            solid_error: solid_error.clone(),
+            sewing_report,
+        },
+        mesh,
+        solid,
+    })
+}
+
 /// Promote classified split faces into healed trim regions and a triangulated shell candidate.
 ///
 /// This is the first output-generation step after split classification. It
@@ -773,35 +879,14 @@ pub fn heal_classified_split_faces(
         push_healed_regions_for_face(solid, &split.a, tolerance, &mut regions)?;
         push_healed_regions_for_face(solid, &split.b, tolerance, &mut regions)?;
     }
-    let mesh = triangulate_healed_regions(&regions, tolerance)?;
-    let (solid, solid_error, sewing_report) = if mesh.triangles.is_empty() {
-        (None, None, None)
+    let raw_mesh = triangulate_healed_regions(&regions, tolerance)?;
+    let (mesh, solid, solid_error, sewing_report) = if raw_mesh.triangles.is_empty() {
+        (raw_mesh, None, None, None)
     } else {
-        match Solid::sew_triangle_mesh(mesh.vertices.clone(), &mesh.triangles, tolerance) {
-            Ok(sewn) => {
-                if sewn.triangles.is_empty() {
-                    (
-                        None,
-                        Some(TopologyError::DegenerateSewnMesh),
-                        Some(sewn.report),
-                    )
-                } else {
-                    let sewn_vertices = sewn.vertices;
-                    let sewn_triangles = sewn.triangles;
-                    let report = sewn.report;
-                    match Solid::from_triangle_mesh(sewn_vertices, &sewn_triangles) {
-                        Ok(mut solid) => {
-                            for edge in &mut solid.edges {
-                                edge.tolerance = tolerance;
-                            }
-                            (Some(solid), None, Some(report))
-                        }
-                        Err(error) => (None, Some(error), Some(report)),
-                    }
-                }
-            }
-            Err(error) => (None, Some(error), None),
-        }
+        let healed = heal_boolean_triangle_mesh(raw_mesh.vertices, &raw_mesh.triangles, tolerance)?;
+        let solid_error = healed.report.solid_error.clone();
+        let sewing_report = Some(healed.report.sewing_report.clone());
+        (healed.mesh, healed.solid, solid_error, sewing_report)
     };
     Ok(HealedBooleanOutput {
         operation: classification.operation,
@@ -892,6 +977,90 @@ struct SegmentDistance {
     distance: f64,
     left_t: f64,
     right_t: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TriangleFilterReport {
+    triangles: Vec<[usize; 3]>,
+    removed_tiny_edge_triangles: usize,
+    removed_sliver_triangles: usize,
+    removed_duplicate_triangles: usize,
+}
+
+fn filter_boolean_triangles(
+    vertices: &[Point3],
+    triangles: &[[usize; 3]],
+    tolerance: f64,
+) -> TriangleFilterReport {
+    let mut report = TriangleFilterReport::default();
+    let mut canonical_triangles = Vec::<[usize; 3]>::new();
+    for tri in triangles.iter().copied() {
+        let a = vertices[tri[0]];
+        let b = vertices[tri[1]];
+        let c = vertices[tri[2]];
+        if triangle_has_tiny_edge(a, b, c, tolerance) {
+            report.removed_tiny_edge_triangles += 1;
+            continue;
+        }
+        if triangle_is_sliver(a, b, c, tolerance) {
+            report.removed_sliver_triangles += 1;
+            continue;
+        }
+        let canonical = canonical_triangle(tri);
+        if canonical_triangles.contains(&canonical) {
+            report.removed_duplicate_triangles += 1;
+            continue;
+        }
+        canonical_triangles.push(canonical);
+        report.triangles.push(tri);
+    }
+    report
+}
+
+fn triangle_has_tiny_edge(a: Point3, b: Point3, c: Point3, tolerance: f64) -> bool {
+    a.distance(b) <= tolerance || b.distance(c) <= tolerance || c.distance(a) <= tolerance
+}
+
+fn triangle_is_sliver(a: Point3, b: Point3, c: Point3, tolerance: f64) -> bool {
+    let ab = a.distance(b);
+    let bc = b.distance(c);
+    let ca = c.distance(a);
+    let max_edge = ab.max(bc).max(ca);
+    if max_edge <= tolerance {
+        return true;
+    }
+    let area = (b - a).cross(c - a).norm() * 0.5;
+    if area <= tolerance * max_edge {
+        return true;
+    }
+    let quality = 4.0 * 3.0_f64.sqrt() * area / (ab * ab + bc * bc + ca * ca);
+    quality <= 1.0e-6
+}
+
+fn canonical_triangle(mut triangle: [usize; 3]) -> [usize; 3] {
+    triangle.sort_unstable();
+    triangle
+}
+
+fn compact_triangle_mesh(vertices: Vec<Point3>, triangles: &[[usize; 3]]) -> HealedTriangleMesh {
+    let mut remap = vec![usize::MAX; vertices.len()];
+    let mut compact_vertices = Vec::<Point3>::new();
+    let mut compact_triangles = Vec::<[usize; 3]>::with_capacity(triangles.len());
+    for tri in triangles {
+        let mut compact = [0; 3];
+        for (corner, vertex) in tri.iter().copied().enumerate() {
+            if remap[vertex] == usize::MAX {
+                remap[vertex] = compact_vertices.len();
+                compact_vertices.push(vertices[vertex]);
+            }
+            compact[corner] = remap[vertex];
+        }
+        compact_triangles.push(compact);
+    }
+    HealedTriangleMesh {
+        vertices: compact_vertices,
+        triangles: compact_triangles,
+    }
 }
 
 fn analyze_vertex_merges(left: &Solid, right: &Solid, tolerance: f64) -> Vec<BooleanMergedVertex> {
