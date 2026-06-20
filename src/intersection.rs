@@ -5,7 +5,10 @@ use crate::math::{Point3, Vec2, Vec3};
 use crate::nurbs::{NurbsCurve, NurbsSurface};
 use crate::predicates::{Interval, RobustSign};
 use crate::tessellation::tessellate_nurbs_surface;
-use crate::topology::{EdgeCurve3D, FaceId, Solid, SplitFacesReport, TopologyError, TrimCurve2D};
+use crate::topology::{
+    EdgeCurve3D, FaceId, Solid, SplitFacesReport, TopologyError, TrimCurve2D,
+    TrimReadyFaceConversionReport,
+};
 
 const SSI_NURBS_FIT_TOLERANCE: f64 = 1.0e-6;
 
@@ -132,6 +135,28 @@ impl TrimReadyIntersectionCurve {
         tolerance: f64,
     ) -> Result<SplitFacesReport, TopologyError> {
         solid.split_faces_with_curves(
+            a_face,
+            b_face,
+            self.edge_curve.clone(),
+            self.a_pcurve.clone(),
+            self.b_pcurve.clone(),
+            tolerance,
+        )
+    }
+
+    /// Promote this trim-ready SSI curve into face trim topology.
+    ///
+    /// Closed curves become inner trim loops on both faces. Open curves are
+    /// gap-closed against nearby trim boundaries and installed as staged face
+    /// splits for later classification.
+    pub fn install_as_trimmed_faces(
+        &self,
+        solid: &mut Solid,
+        a_face: FaceId,
+        b_face: FaceId,
+        tolerance: f64,
+    ) -> Result<TrimReadyFaceConversionReport, TopologyError> {
+        solid.install_trim_ready_face_curve(
             a_face,
             b_face,
             self.edge_curve.clone(),

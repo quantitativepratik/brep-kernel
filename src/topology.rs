@@ -795,6 +795,32 @@ pub struct SplitFacesReport {
     pub b_split: usize,
 }
 
+/// How a trim-ready SSI curve was promoted into face topology.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrimReadyFaceConversionKind {
+    /// Open curve installed as a staged face split.
+    OpenSplit,
+    /// Closed curve installed as inner trim loops on both faces.
+    ClosedInnerLoops,
+}
+
+/// Result of promoting one trim-ready SSI curve into face trim topology.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrimReadyFaceConversionReport {
+    /// Conversion mode.
+    pub kind: TrimReadyFaceConversionKind,
+    /// Staged split report for open curves.
+    pub split: Option<SplitFacesReport>,
+    /// Installed or matched loop index on the first face for closed curves.
+    pub a_loop: Option<usize>,
+    /// Installed or matched loop index on the second face for closed curves.
+    pub b_loop: Option<usize>,
+    /// Number of p-curve endpoints snapped to existing trim boundaries.
+    pub snapped_pcurve_endpoints: usize,
+    /// True when an existing equivalent split/loop was reused.
+    pub merged_existing: bool,
+}
+
 /// Topology construction or validation error.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TopologyError {
@@ -1433,6 +1459,295 @@ impl Solid {
             a_split,
             b_split,
         })
+    }
+
+    /// Promote a trim-ready SSI curve into face trim topology.
+    ///
+    /// Closed SSI curves become inner trim loops on both faces. Open curves are
+    /// gap-closed against nearby face boundaries and installed as staged face
+    /// splits for later Boolean classification. Existing equivalent closed loops
+    /// or open split edges are reused instead of duplicated.
+    pub fn install_trim_ready_face_curve(
+        &mut self,
+        a_face: FaceId,
+        b_face: FaceId,
+        edge_curve: EdgeCurve3D,
+        a_pcurve: TrimCurve2D,
+        b_pcurve: TrimCurve2D,
+        tolerance: f64,
+    ) -> Result<TrimReadyFaceConversionReport, TopologyError> {
+        if a_face >= self.faces.len() {
+            return Err(TopologyError::InvalidFace(a_face));
+        }
+        if b_face >= self.faces.len() {
+            return Err(TopologyError::InvalidFace(b_face));
+        }
+        if a_face == b_face {
+            return Err(TopologyError::DegenerateFaceSplit(a_face));
+        }
+        if !tolerance.is_finite() || tolerance < 0.0 || !edge_curve.is_valid() {
+            return Err(TopologyError::InvalidSplitCurve(self.split_edges.len()));
+        }
+        if !a_pcurve.is_valid() || a_pcurve.endpoints().is_none() {
+            return Err(TopologyError::InvalidFaceSplit(
+                a_face,
+                self.faces[a_face].split_curves.len(),
+            ));
+        }
+        if !b_pcurve.is_valid() || b_pcurve.endpoints().is_none() {
+            return Err(TopologyError::InvalidFaceSplit(
+                b_face,
+                self.faces[b_face].split_curves.len(),
+            ));
+        }
+
+        let old_split_edges = self.split_edges.clone();
+        let old_a_splits = self.faces[a_face].split_curves.clone();
+        let old_b_splits = self.faces[b_face].split_curves.clone();
+        let old_a_loops = self.faces[a_face].trim_loops.clone();
+        let old_b_loops = self.faces[b_face].trim_loops.clone();
+
+        let (mut a_pcurve, a_snaps) =
+            self.close_pcurve_gaps_to_face_boundary(a_face, a_pcurve, tolerance);
+        let (mut b_pcurve, b_snaps) =
+            self.close_pcurve_gaps_to_face_boundary(b_face, b_pcurve, tolerance);
+        let snapped_pcurve_endpoints = a_snaps + b_snaps;
+
+        if trim_curve_is_closed_on_surface(&self.faces[a_face].surface, &a_pcurve, tolerance)
+            && trim_curve_is_closed_on_surface(&self.faces[b_face].surface, &b_pcurve, tolerance)
+            && edge_curve.endpoints().is_some_and(|(start, end)| {
+                start.distance(end) <= tolerance.max(DEFAULT_EDGE_TOLERANCE)
+            })
+        {
+            a_pcurve = close_trim_curve(a_pcurve);
+            b_pcurve = close_trim_curve(b_pcurve);
+
+            let existing_a = self.find_matching_inner_trim_loop(a_face, &a_pcurve, tolerance);
+            let existing_b = self.find_matching_inner_trim_loop(b_face, &b_pcurve, tolerance);
+            if let (Some(a_loop), Some(b_loop)) = (existing_a, existing_b) {
+                return Ok(TrimReadyFaceConversionReport {
+                    kind: TrimReadyFaceConversionKind::ClosedInnerLoops,
+                    split: None,
+                    a_loop: Some(a_loop),
+                    b_loop: Some(b_loop),
+                    snapped_pcurve_endpoints,
+                    merged_existing: true,
+                });
+            }
+
+            let a_loop = self.faces[a_face].trim_loops.len();
+            let b_loop = self.faces[b_face].trim_loops.len();
+            self.faces[a_face].trim_loops.push(TrimLoop::new(
+                TrimLoopKind::Inner,
+                vec![Trim::curve(a_pcurve, tolerance)],
+            ));
+            self.faces[b_face].trim_loops.push(TrimLoop::new(
+                TrimLoopKind::Inner,
+                vec![Trim::curve(b_pcurve, tolerance)],
+            ));
+
+            if let Err(error) = self
+                .validate_trim_topology()
+                .and_then(|_| self.validate_trim_loop_nesting(a_face, tolerance))
+                .and_then(|_| self.validate_trim_loop_nesting(b_face, tolerance))
+            {
+                self.faces[a_face].trim_loops = old_a_loops;
+                self.faces[b_face].trim_loops = old_b_loops;
+                self.faces[a_face].split_curves = old_a_splits;
+                self.faces[b_face].split_curves = old_b_splits;
+                self.split_edges = old_split_edges;
+                return Err(error);
+            }
+
+            return Ok(TrimReadyFaceConversionReport {
+                kind: TrimReadyFaceConversionKind::ClosedInnerLoops,
+                split: None,
+                a_loop: Some(a_loop),
+                b_loop: Some(b_loop),
+                snapped_pcurve_endpoints,
+                merged_existing: false,
+            });
+        }
+
+        let edge_curve =
+            self.edge_curve_with_pcurve_endpoints(edge_curve, a_face, &a_pcurve, tolerance);
+        if let Some(split) = self.find_matching_face_split(
+            a_face,
+            b_face,
+            &edge_curve,
+            &a_pcurve,
+            &b_pcurve,
+            tolerance,
+        ) {
+            return Ok(TrimReadyFaceConversionReport {
+                kind: TrimReadyFaceConversionKind::OpenSplit,
+                split: Some(split),
+                a_loop: None,
+                b_loop: None,
+                snapped_pcurve_endpoints,
+                merged_existing: true,
+            });
+        }
+
+        match self
+            .split_faces_with_curves(a_face, b_face, edge_curve, a_pcurve, b_pcurve, tolerance)
+        {
+            Ok(split) => Ok(TrimReadyFaceConversionReport {
+                kind: TrimReadyFaceConversionKind::OpenSplit,
+                split: Some(split),
+                a_loop: None,
+                b_loop: None,
+                snapped_pcurve_endpoints,
+                merged_existing: false,
+            }),
+            Err(error) => {
+                self.faces[a_face].trim_loops = old_a_loops;
+                self.faces[b_face].trim_loops = old_b_loops;
+                self.faces[a_face].split_curves = old_a_splits;
+                self.faces[b_face].split_curves = old_b_splits;
+                self.split_edges = old_split_edges;
+                Err(error)
+            }
+        }
+    }
+
+    fn close_pcurve_gaps_to_face_boundary(
+        &self,
+        face: FaceId,
+        pcurve: TrimCurve2D,
+        tolerance: f64,
+    ) -> (TrimCurve2D, usize) {
+        let Some((start, end)) = pcurve.endpoints() else {
+            return (pcurve, 0);
+        };
+        let mut snapped = 0;
+        let mut new_start = start;
+        let mut new_end = end;
+        if let Some(point) = self.nearest_face_trim_point(face, start, tolerance) {
+            if surface_parameter_distance(&self.faces[face].surface, start, point, tolerance)
+                <= tolerance
+            {
+                new_start = point;
+                snapped += 1;
+            }
+        }
+        if let Some(point) = self.nearest_face_trim_point(face, end, tolerance) {
+            if surface_parameter_distance(&self.faces[face].surface, end, point, tolerance)
+                <= tolerance
+            {
+                new_end = point;
+                snapped += 1;
+            }
+        }
+        (
+            trim_curve_with_endpoints(pcurve, new_start, new_end),
+            snapped,
+        )
+    }
+
+    fn nearest_face_trim_point(&self, face: FaceId, point: Vec2, tolerance: f64) -> Option<Vec2> {
+        let mut best = None;
+        let mut best_distance = tolerance;
+        for trim_loop in &self.faces.get(face)?.trim_loops {
+            for trim in &trim_loop.trims {
+                let samples = trim.curve.sample_points(33)?;
+                for segment in samples.windows(2) {
+                    let candidate = closest_point_on_segment(point, segment[0], segment[1]);
+                    let distance = surface_parameter_distance(
+                        &self.faces[face].surface,
+                        point,
+                        candidate,
+                        tolerance,
+                    );
+                    if distance <= best_distance {
+                        best = Some(candidate);
+                        best_distance = distance;
+                    }
+                }
+            }
+        }
+        best
+    }
+
+    fn find_matching_inner_trim_loop(
+        &self,
+        face: FaceId,
+        pcurve: &TrimCurve2D,
+        tolerance: f64,
+    ) -> Option<usize> {
+        let incoming = pcurve.sample_points(33)?;
+        for (loop_index, trim_loop) in self.faces.get(face)?.trim_loops.iter().enumerate() {
+            if trim_loop.kind != TrimLoopKind::Inner {
+                continue;
+            }
+            let existing = trim_loop_sample_points(trim_loop, 33, tolerance)?;
+            if closed_polylines_match(&incoming, &existing, tolerance) {
+                return Some(loop_index);
+            }
+        }
+        None
+    }
+
+    fn edge_curve_with_pcurve_endpoints(
+        &self,
+        edge_curve: EdgeCurve3D,
+        face: FaceId,
+        pcurve: &TrimCurve2D,
+        tolerance: f64,
+    ) -> EdgeCurve3D {
+        let Some((start_uv, end_uv)) = pcurve.endpoints() else {
+            return edge_curve;
+        };
+        let Some(start) = self.faces[face].surface.evaluate(start_uv) else {
+            return edge_curve;
+        };
+        let Some(end) = self.faces[face].surface.evaluate(end_uv) else {
+            return edge_curve;
+        };
+        let Some((old_start, old_end)) = edge_curve.endpoints() else {
+            return edge_curve;
+        };
+        if old_start.distance(start) <= tolerance.max(DEFAULT_EDGE_TOLERANCE)
+            && old_end.distance(end) <= tolerance.max(DEFAULT_EDGE_TOLERANCE)
+        {
+            trim_edge_curve_with_endpoints(edge_curve, start, end)
+        } else {
+            edge_curve
+        }
+    }
+
+    fn find_matching_face_split(
+        &self,
+        a_face: FaceId,
+        b_face: FaceId,
+        edge_curve: &EdgeCurve3D,
+        a_pcurve: &TrimCurve2D,
+        b_pcurve: &TrimCurve2D,
+        tolerance: f64,
+    ) -> Option<SplitFacesReport> {
+        for (a_split, a_use) in self.faces.get(a_face)?.split_curves.iter().enumerate() {
+            let split_edge = self.split_edges.get(a_use.split_edge)?;
+            if !edge_curves_match(&split_edge.curve, edge_curve, tolerance) {
+                continue;
+            }
+            if !trim_curves_match(&a_use.pcurve, a_pcurve, tolerance) {
+                continue;
+            }
+            for (b_split, b_use) in self.faces.get(b_face)?.split_curves.iter().enumerate() {
+                if b_use.split_edge == a_use.split_edge
+                    && trim_curves_match(&b_use.pcurve, b_pcurve, tolerance)
+                {
+                    return Some(SplitFacesReport {
+                        split_edge: a_use.split_edge,
+                        a_face,
+                        b_face,
+                        a_split,
+                        b_split,
+                    });
+                }
+            }
+        }
+        None
     }
 
     /// Return the model-space endpoint vertex ids for an edge.
@@ -2304,6 +2619,139 @@ fn edge_curve_has_span(curve: &EdgeCurve3D, tolerance: f64) -> bool {
             .any(|edge| edge[0].distance(edge[1]) > tolerance),
         EdgeCurve3D::Unresolved => false,
     }
+}
+
+fn trim_curve_is_closed_on_surface(
+    surface: &FaceSurface,
+    curve: &TrimCurve2D,
+    tolerance: f64,
+) -> bool {
+    curve.endpoints().is_some_and(|(start, end)| {
+        surface_parameter_distance(surface, start, end, tolerance) <= tolerance
+    })
+}
+
+fn close_trim_curve(curve: TrimCurve2D) -> TrimCurve2D {
+    let Some((start, _)) = curve.endpoints() else {
+        return curve;
+    };
+    trim_curve_with_endpoints(curve, start, start)
+}
+
+fn trim_edge_curve_with_endpoints(curve: EdgeCurve3D, start: Point3, end: Point3) -> EdgeCurve3D {
+    match curve {
+        EdgeCurve3D::LineSegment { .. } => EdgeCurve3D::LineSegment { start, end },
+        EdgeCurve3D::Polyline { mut points } => {
+            if let Some(first) = points.first_mut() {
+                *first = start;
+            }
+            if let Some(last) = points.last_mut() {
+                *last = end;
+            }
+            EdgeCurve3D::Polyline { points }
+        }
+        EdgeCurve3D::Nurbs(mut curve) => {
+            if let Some(first) = curve.control_points.first_mut() {
+                *first = start;
+            }
+            if let Some(last) = curve.control_points.last_mut() {
+                *last = end;
+            }
+            EdgeCurve3D::Nurbs(curve)
+        }
+        other => other,
+    }
+}
+
+fn edge_curves_match(a: &EdgeCurve3D, b: &EdgeCurve3D, tolerance: f64) -> bool {
+    let Some(a_points) = a.sample_points(17) else {
+        return false;
+    };
+    let Some(b_points) = b.sample_points(17) else {
+        return false;
+    };
+    open_point3_polylines_match(&a_points, &b_points, tolerance)
+}
+
+fn trim_curves_match(a: &TrimCurve2D, b: &TrimCurve2D, tolerance: f64) -> bool {
+    let Some(a_points) = a.sample_points(17) else {
+        return false;
+    };
+    let Some(b_points) = b.sample_points(17) else {
+        return false;
+    };
+    open_vec2_polylines_match(&a_points, &b_points, tolerance)
+}
+
+fn open_point3_polylines_match(a: &[Point3], b: &[Point3], tolerance: f64) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let forward = a
+        .iter()
+        .zip(b.iter())
+        .all(|(a, b)| a.distance(*b) <= tolerance);
+    let reverse = a
+        .iter()
+        .zip(b.iter().rev())
+        .all(|(a, b)| a.distance(*b) <= tolerance);
+    forward || reverse
+}
+
+fn open_vec2_polylines_match(a: &[Vec2], b: &[Vec2], tolerance: f64) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let forward = a
+        .iter()
+        .zip(b.iter())
+        .all(|(a, b)| vec2_distance(*a, *b) <= tolerance);
+    let reverse = a
+        .iter()
+        .zip(b.iter().rev())
+        .all(|(a, b)| vec2_distance(*a, *b) <= tolerance);
+    forward || reverse
+}
+
+fn closed_polylines_match(a: &[Vec2], b: &[Vec2], tolerance: f64) -> bool {
+    let a = normalized_closed_polyline(a, tolerance);
+    let b = normalized_closed_polyline(b, tolerance);
+    if a.len() != b.len() || a.is_empty() {
+        return false;
+    }
+    for offset in 0..b.len() {
+        let forward = (0..a.len())
+            .all(|index| vec2_distance(a[index], b[(index + offset) % b.len()]) <= tolerance);
+        if forward {
+            return true;
+        }
+        let reverse = (0..a.len()).all(|index| {
+            let b_index = (offset + b.len() - index % b.len()) % b.len();
+            vec2_distance(a[index], b[b_index]) <= tolerance
+        });
+        if reverse {
+            return true;
+        }
+    }
+    false
+}
+
+fn normalized_closed_polyline(points: &[Vec2], tolerance: f64) -> Vec<Vec2> {
+    let mut points = compact_uv_samples(points, tolerance);
+    if points.len() >= 2 && vec2_distance(points[0], points[points.len() - 1]) <= tolerance {
+        points.pop();
+    }
+    points
+}
+
+fn closest_point_on_segment(point: Vec2, a: Vec2, b: Vec2) -> Vec2 {
+    let edge = b - a;
+    let len2 = edge.dot(edge);
+    if len2 <= f64::EPSILON {
+        return a;
+    }
+    let t = ((point - a).dot(edge) / len2).clamp(0.0, 1.0);
+    a + edge * t
 }
 
 fn pcurve_from_uv_samples(points: &[Vec2], tolerance: f64) -> Option<TrimCurve2D> {

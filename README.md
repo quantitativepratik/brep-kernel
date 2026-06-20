@@ -45,6 +45,7 @@ Then open `http://localhost:8080/web/`.
 - Face splitting:
   - staged `SplitEdge` records with one model-space curve and per-face p-curves
   - rollback-safe installation of trim-ready SSI output onto two analytic faces
+  - trim-ready SSI promotion that gap-closes open curves to existing trims, merges duplicate split edges, and installs closed curves as inner trim loops on both faces
 - Boolean classification:
   - classifies staged face splits by trim-domain location and local inside/outside side
   - maps split sides to Union/Intersect/Subtract keep, discard, and reversed-keep actions
@@ -129,16 +130,16 @@ cargo check --features native-viewer --bin native-viewer --locked
 
 ## Design Boundaries
 
-The boolean module deliberately supports one hard representative closed-output case instead of pretending to solve all solid modeling. The result is a real closed half-edge solid for cube-minus-cylinder with `V - E + F = 0`, which is the expected genus-1 topology. For the general pipeline, staged split faces can now be classified into local Boolean keep/discard decisions, promoted into healed trim regions for supported boundary-to-boundary splits, triangulated, welded, and submitted to the half-edge validator. Broad multi-split region graphs, coincident overlaps, and automatic classification of unsplit faces are still outside the supported scope.
+The boolean module deliberately supports one hard representative closed-output case instead of pretending to solve all solid modeling. The result is a real closed half-edge solid for cube-minus-cylinder with `V - E + F = 0`, which is the expected genus-1 topology. For the general pipeline, trim-ready SSI curves can now be gap-closed and promoted into staged split records or closed inner trim loops, staged split faces can be classified into local Boolean keep/discard decisions, and supported boundary-to-boundary splits can be promoted into healed trim regions, triangulated, sewn, and submitted to the half-edge validator. Broad multi-split region graphs, coincident overlaps, and automatic classification of unsplit faces are still outside the supported scope.
 
-The intersection module has exact analytic line/plane and plane/plane routines, plus marching/bracketing routines for NURBS cases. The NURBS/NURBS SSI path emits trim-ready `EdgeCurve3D` plus two `TrimCurve2D` p-curves, and the topology layer can install those curves as staged face splits. It is not yet a full CAD face-intersection engine: coplanar overlap classification, coincident face merging, trim-loop healing, and shell rewrites are the next major layers.
+The intersection module has exact analytic line/plane and plane/plane routines, plus marching/bracketing routines for NURBS cases. The NURBS/NURBS SSI path emits trim-ready `EdgeCurve3D` plus two `TrimCurve2D` p-curves, and the topology layer can install those curves as staged face splits or closed inner trim loops. It is not yet a full CAD face-intersection engine: coplanar overlap classification, coincident face merging, multi-split region graphs, and global shell rewrites are the next major layers.
 
 The predicates are conservative interval filters. When a determinant cannot be certified, the API returns `Uncertain`; it does not silently trust an unstable sign.
 
 ## Roadmap
 
 - Broaden Euler operators beyond the current `MVFS`, `MEV`, and `MEF` construction layer.
-- Promote staged face splits into healed trim loops and rewritten shell topology.
+- Promote broader staged face-split graphs into healed trim loops and rewritten shell topology.
 - Extend NURBS/NURBS SSI with coplanar overlap classification and higher-order curve fitting.
 - Generalize healed Boolean output to multi-split region graphs, unsplit-face classification, and coincident overlap cases.
 - Add viewer overlays for topology, normals, residuals, and golden-reference inspection.

@@ -11,6 +11,7 @@ Initial public prototype:
 - periodic seam unwrapping and singular surface-boundary handling for p-curves
 - topology-level tolerance-aware triangle mesh sewing with deterministic reports
 - staged face splitting from trim-ready SSI curves
+- gap-closing trim-ready SSI promotion into open splits or closed inner trim loops
 - Boolean classification over staged split faces
 - healed Boolean trim-region generation for supported split faces
 - NURBS curve/surface evaluation, derivatives, and curve interpolation
