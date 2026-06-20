@@ -53,6 +53,8 @@ Then open `http://localhost:8080/web/`.
 - Boolean classification:
   - classifies staged face splits by trim-domain location and local inside/outside side
   - maps split sides to Union/Intersect/Subtract keep, discard, and reversed-keep actions
+  - partitions affected face domains by multiple active split curves per face
+  - emits classified regions for both split faces and unsplit faces
 - Healed Boolean output:
   - promotes supported classified split sides into new trim loops
   - triangulates healed regions, runs tolerance-aware sewing, and validates a new half-edge solid when the generated shell closes
@@ -134,7 +136,7 @@ cargo check --features native-viewer --bin native-viewer --locked
 
 ## Design Boundaries
 
-The boolean module deliberately supports one hard representative closed-output case instead of pretending to solve all solid modeling. The result is a real closed half-edge solid for cube-minus-cylinder with `V - E + F = 0`, which is the expected genus-1 topology. For the general pipeline, the module can now build a total face-pair intersection graph across two solids, including disjoint pairs, adjacency for non-empty pairs, analytic NURBS curve records where supported, and finite triangle-face fallback segments for current half-edge solids. Trim-ready SSI curves can be gap-closed and promoted into staged split records or closed inner trim loops, staged split faces can be classified into local Boolean keep/discard decisions, and supported boundary-to-boundary splits can be promoted into healed trim regions, triangulated, sewn, and submitted to the half-edge validator. Broad multi-split region promotion into final shell topology, robust coincident-overlap merging, and automatic classification of unsplit faces are still outside the supported scope.
+The boolean module deliberately supports one hard representative closed-output case instead of pretending to solve all solid modeling. The result is a real closed half-edge solid for cube-minus-cylinder with `V - E + F = 0`, which is the expected genus-1 topology. For the general pipeline, the module can now build a total face-pair intersection graph across two solids, including disjoint pairs, adjacency for non-empty pairs, analytic NURBS curve records where supported, and finite triangle-face fallback segments for current half-edge solids. Trim-ready SSI curves can be gap-closed and promoted into staged split records or closed inner trim loops. The region classifier partitions affected faces by multiple active split curves, classifies all emitted regions, and includes unsplit faces when the opposite labelled operand is closed enough for point-in-solid testing. Supported boundary-to-boundary splits can be promoted into healed trim regions, triangulated, sewn, and submitted to the half-edge validator. Broad region promotion into final rewritten shell topology, robust coincident-overlap merging, and general curved arrangement construction are still outside the supported scope.
 
 The intersection module has exact analytic line/plane and plane/plane routines, plus marching/bracketing routines for NURBS cases. The NURBS/NURBS SSI path emits trim-ready `EdgeCurve3D` plus two `TrimCurve2D` p-curves, and the topology layer can install those curves as staged face splits or closed inner trim loops. It is not yet a full CAD face-intersection engine: coplanar overlap classification, coincident face merging, multi-split region graphs, and global shell rewrites are the next major layers.
 
@@ -145,7 +147,7 @@ The predicates are conservative interval filters. When a determinant cannot be c
 - Broaden Euler operators beyond the current `MVFS`, `MEV`, and `MEF` construction layer.
 - Promote broader staged face-split graphs into healed trim loops and rewritten shell topology.
 - Extend NURBS/NURBS SSI with coplanar overlap classification and higher-order curve fitting.
-- Generalize healed Boolean output from the all-pairs intersection graph into multi-split region graphs, unsplit-face classification, and coincident overlap cases.
+- Generalize healed Boolean output from classified region graphs into rewritten trim loops, stitched shell topology, and coincident overlap cases.
 - Add viewer overlays for topology, normals, residuals, and golden-reference inspection.
 
 ## Repository Map

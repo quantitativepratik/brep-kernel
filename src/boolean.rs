@@ -137,6 +137,60 @@ pub struct BooleanClassificationReport {
     pub classifications: Vec<BooleanSplitClassification>,
 }
 
+/// One connected face-domain region after applying all active split curves on a face.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BooleanClassifiedRegion {
+    /// Source face for this region.
+    pub face: FaceId,
+    /// Boolean operand that owns the source face.
+    pub operand: BooleanOperand,
+    /// Face-local split indices considered while partitioning this face.
+    pub source_splits: Vec<usize>,
+    /// True when the source face had no active split curves.
+    pub unsplit_face: bool,
+    /// Inside/outside classification of this region relative to the opposite operand.
+    pub side: BooleanRegionSide,
+    /// Keep/discard action for this region under the requested Boolean operation.
+    pub action: BooleanRegionAction,
+    /// Region boundary in the source face parameter domain.
+    pub uv_loop: Vec<Vec2>,
+    /// Interior sample used for classification.
+    pub sample_uv: Vec2,
+    /// Model-space sample point when the source support surface can be evaluated.
+    pub sample_point: Option<Point3>,
+    /// True when the region should be emitted with reversed orientation.
+    pub orientation_reversed: bool,
+}
+
+/// Report for classifying every face region, including unsplit faces.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BooleanRegionClassificationReport {
+    /// Boolean operation being classified.
+    pub operation: BooleanOp,
+    /// Number of faces considered.
+    pub face_count: usize,
+    /// Number of staged split edges considered.
+    pub split_count: usize,
+    /// Number of faces with at least one active split curve.
+    pub affected_face_count: usize,
+    /// Number of emitted regions.
+    pub region_count: usize,
+    /// Number of regions emitted from split faces.
+    pub split_region_count: usize,
+    /// Number of regions emitted from unsplit faces.
+    pub unsplit_region_count: usize,
+    /// Number of regions with a keep action.
+    pub kept_region_count: usize,
+    /// Number of regions with a discard action.
+    pub discarded_region_count: usize,
+    /// Number of regions whose action remains ambiguous.
+    pub ambiguous_region_count: usize,
+    /// Per-region classifications.
+    pub regions: Vec<BooleanClassifiedRegion>,
+    /// Underlying per-split side classification.
+    pub split_classification: BooleanClassificationReport,
+}
+
 /// Local side selected for a healed face region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HealedRegionSide {
@@ -408,6 +462,115 @@ pub fn classify_split_faces(
         split_count: solid.split_edges.len(),
         active_split_count,
         classifications,
+    })
+}
+
+/// Split all affected face domains by their active split curves and classify every region.
+///
+/// Split faces are partitioned in UV space by all active staged split p-curves on
+/// that face. Faces with no active split curves still produce one region and are
+/// classified against the opposite operand when that operand's labelled face
+/// subset is closed. The output is a region graph for later trim-loop rewriting;
+/// it does not mutate the shell topology.
+pub fn classify_boolean_regions(
+    solid: &Solid,
+    face_operands: &[BooleanOperand],
+    operation: BooleanOp,
+    tolerance: f64,
+) -> Result<BooleanRegionClassificationReport, BooleanError> {
+    if face_operands.len() != solid.faces.len() {
+        return Err(BooleanError::InvalidInput(
+            "face_operands must contain one entry per face",
+        ));
+    }
+    if !tolerance.is_finite() || tolerance < 0.0 {
+        return Err(BooleanError::InvalidInput("tolerance must be nonnegative"));
+    }
+
+    solid.validate()?;
+    let tolerance = tolerance.max(1.0e-9);
+    let split_classification = classify_split_faces(solid, face_operands, operation, tolerance)?;
+    let mut active_by_face = vec![Vec::<BooleanFaceSplitClassification>::new(); solid.faces.len()];
+    for split in &split_classification.classifications {
+        if split.status == BooleanSplitStatus::Active {
+            active_by_face[split.a.face].push(split.a.clone());
+            active_by_face[split.b.face].push(split.b.clone());
+        }
+    }
+    let operand_closed = [
+        operand_subset_is_closed(solid, face_operands, BooleanOperand::Left),
+        operand_subset_is_closed(solid, face_operands, BooleanOperand::Right),
+    ];
+    let context = RegionClassificationContext {
+        solid,
+        face_operands,
+        operand_closed,
+        operation,
+        tolerance,
+    };
+
+    let mut regions = Vec::new();
+    let mut affected_face_count = 0;
+    for face in 0..solid.faces.len() {
+        let outer = face_outer_loop_polyline(solid, face, tolerance)?;
+        let operand = face_operands[face];
+        let active_splits = &active_by_face[face];
+        if active_splits.is_empty() {
+            regions.push(classified_region_from_loop(
+                &context,
+                face,
+                operand,
+                &[],
+                true,
+                outer,
+            )?);
+            continue;
+        }
+
+        affected_face_count += 1;
+        let cells =
+            split_face_domain_by_active_curves(solid, face, &outer, active_splits, tolerance);
+        for cell in cells {
+            regions.push(classified_region_from_loop(
+                &context,
+                face,
+                operand,
+                active_splits,
+                false,
+                cell,
+            )?);
+        }
+    }
+
+    let region_count = regions.len();
+    let split_region_count = regions.iter().filter(|region| !region.unsplit_face).count();
+    let unsplit_region_count = regions.iter().filter(|region| region.unsplit_face).count();
+    let kept_region_count = regions
+        .iter()
+        .filter(|region| action_keeps_region(region.action))
+        .count();
+    let discarded_region_count = regions
+        .iter()
+        .filter(|region| region.action == BooleanRegionAction::Discard)
+        .count();
+    let ambiguous_region_count = regions
+        .iter()
+        .filter(|region| region.action == BooleanRegionAction::Ambiguous)
+        .count();
+
+    Ok(BooleanRegionClassificationReport {
+        operation,
+        face_count: solid.faces.len(),
+        split_count: solid.split_edges.len(),
+        affected_face_count,
+        region_count,
+        split_region_count,
+        unsplit_region_count,
+        kept_region_count,
+        discarded_region_count,
+        ambiguous_region_count,
+        regions,
+        split_classification,
     })
 }
 
@@ -1330,6 +1493,14 @@ enum LoopPointLocation {
     Outside,
 }
 
+struct RegionClassificationContext<'a> {
+    solid: &'a Solid,
+    face_operands: &'a [BooleanOperand],
+    operand_closed: [bool; 2],
+    operation: BooleanOp,
+    tolerance: f64,
+}
+
 fn split_uses(solid: &Solid) -> Vec<Vec<SplitUse>> {
     let mut uses = vec![Vec::new(); solid.split_edges.len()];
     for (face, face_record) in solid.faces.iter().enumerate() {
@@ -1402,6 +1573,400 @@ fn split_status(
         return BooleanSplitStatus::Ambiguous;
     }
     BooleanSplitStatus::Active
+}
+
+fn classified_region_from_loop(
+    context: &RegionClassificationContext<'_>,
+    face: FaceId,
+    operand: BooleanOperand,
+    active_splits: &[BooleanFaceSplitClassification],
+    unsplit_face: bool,
+    mut uv_loop: Vec<Vec2>,
+) -> Result<BooleanClassifiedRegion, BooleanError> {
+    let tolerance = context.tolerance;
+    cleanup_loop(&mut uv_loop, tolerance);
+    if !polygon_is_usable(&uv_loop, tolerance) {
+        return Err(BooleanError::Unsupported);
+    }
+    if polygon_signed_area(&uv_loop) < 0.0 {
+        uv_loop.reverse();
+    }
+    let sample_uv = polygon_centroid(&uv_loop);
+    let sample_point = context.solid.faces[face].surface.evaluate(sample_uv);
+    let side = classify_region_sample_side(
+        context,
+        face,
+        operand,
+        active_splits,
+        sample_uv,
+        sample_point,
+    );
+    let action = action_for_side(context.operation, operand, other_operand(operand), side);
+    Ok(BooleanClassifiedRegion {
+        face,
+        operand,
+        source_splits: active_splits
+            .iter()
+            .map(|split| split.split_index)
+            .collect(),
+        unsplit_face,
+        side,
+        action,
+        uv_loop,
+        sample_uv,
+        sample_point,
+        orientation_reversed: action == BooleanRegionAction::KeepReversed,
+    })
+}
+
+fn classify_region_sample_side(
+    context: &RegionClassificationContext<'_>,
+    face: FaceId,
+    operand: BooleanOperand,
+    active_splits: &[BooleanFaceSplitClassification],
+    sample_uv: Vec2,
+    sample_point: Option<Point3>,
+) -> BooleanRegionSide {
+    let tolerance = context.tolerance;
+    let other = other_operand(operand);
+    if !operand_has_faces(context.face_operands, other) {
+        return BooleanRegionSide::OutsideOther;
+    }
+    if context.operand_closed[operand_index(other)] {
+        if let Some(point) = sample_point {
+            let side = classify_point_against_operand(
+                context.solid,
+                context.face_operands,
+                other,
+                point,
+                tolerance,
+            );
+            if side != BooleanRegionSide::Ambiguous {
+                return side;
+            }
+        }
+    }
+    classify_region_sample_from_splits(context.solid, face, active_splits, sample_uv, tolerance)
+        .unwrap_or(BooleanRegionSide::Ambiguous)
+}
+
+fn classify_region_sample_from_splits(
+    solid: &Solid,
+    face: FaceId,
+    active_splits: &[BooleanFaceSplitClassification],
+    sample_uv: Vec2,
+    tolerance: f64,
+) -> Option<BooleanRegionSide> {
+    let mut saw_inside = false;
+    let mut saw_outside = false;
+    for split in active_splits {
+        let pcurve = &solid.faces[face].split_curves[split.split_index].pcurve;
+        let Some((uv, tangent)) = representative_pcurve_sample(pcurve, tolerance) else {
+            continue;
+        };
+        let signed = tangent.cross(sample_uv - uv);
+        if signed.abs() <= tolerance {
+            continue;
+        }
+        match if signed > 0.0 {
+            split.left_of_curve
+        } else {
+            split.right_of_curve
+        } {
+            BooleanRegionSide::InsideOther => saw_inside = true,
+            BooleanRegionSide::OutsideOther => saw_outside = true,
+            BooleanRegionSide::Ambiguous => {}
+        }
+    }
+    if saw_outside {
+        Some(BooleanRegionSide::OutsideOther)
+    } else if saw_inside {
+        Some(BooleanRegionSide::InsideOther)
+    } else {
+        None
+    }
+}
+
+fn split_face_domain_by_active_curves(
+    solid: &Solid,
+    face: FaceId,
+    outer: &[Vec2],
+    active_splits: &[BooleanFaceSplitClassification],
+    tolerance: f64,
+) -> Vec<Vec<Vec2>> {
+    let mut cells = vec![outer.to_vec()];
+    for split in active_splits {
+        let pcurve = &solid.faces[face].split_curves[split.split_index].pcurve;
+        let Some((point, tangent)) = representative_pcurve_sample(pcurve, tolerance) else {
+            continue;
+        };
+        if vec2_norm(tangent) <= tolerance {
+            continue;
+        }
+
+        let mut next_cells = Vec::<Vec<Vec2>>::new();
+        for cell in &cells {
+            let left = clip_polygon_by_oriented_line(cell, point, tangent, true, tolerance);
+            let right = clip_polygon_by_oriented_line(cell, point, tangent, false, tolerance);
+            if polygon_is_usable(&left, tolerance) {
+                push_unique_polygon(&mut next_cells, left, tolerance);
+            }
+            if polygon_is_usable(&right, tolerance) {
+                push_unique_polygon(&mut next_cells, right, tolerance);
+            }
+        }
+        if !next_cells.is_empty() {
+            cells = next_cells;
+        } else {
+            break;
+        }
+    }
+    cells
+}
+
+fn clip_polygon_by_oriented_line(
+    polygon: &[Vec2],
+    point: Vec2,
+    tangent: Vec2,
+    keep_left: bool,
+    tolerance: f64,
+) -> Vec<Vec2> {
+    if polygon.len() < 3 {
+        return Vec::new();
+    }
+    let mut output = Vec::new();
+    for index in 0..polygon.len() {
+        let current = polygon[index];
+        let next = polygon[(index + 1) % polygon.len()];
+        let current_signed = tangent.cross(current - point);
+        let next_signed = tangent.cross(next - point);
+        let current_inside = if keep_left {
+            current_signed >= -tolerance
+        } else {
+            current_signed <= tolerance
+        };
+        let next_inside = if keep_left {
+            next_signed >= -tolerance
+        } else {
+            next_signed <= tolerance
+        };
+
+        if current_inside && next_inside {
+            push_unique_uv_with_tolerance(&mut output, next, tolerance);
+        } else if current_inside && !next_inside {
+            push_unique_uv_with_tolerance(
+                &mut output,
+                line_edge_intersection(current, next, current_signed, next_signed),
+                tolerance,
+            );
+        } else if !current_inside && next_inside {
+            push_unique_uv_with_tolerance(
+                &mut output,
+                line_edge_intersection(current, next, current_signed, next_signed),
+                tolerance,
+            );
+            push_unique_uv_with_tolerance(&mut output, next, tolerance);
+        }
+    }
+    cleanup_loop(&mut output, tolerance);
+    output
+}
+
+fn line_edge_intersection(start: Vec2, end: Vec2, start_signed: f64, end_signed: f64) -> Vec2 {
+    let denom = start_signed - end_signed;
+    if denom.abs() <= f64::EPSILON {
+        (start + end) * 0.5
+    } else {
+        start + (end - start) * (start_signed / denom).clamp(0.0, 1.0)
+    }
+}
+
+fn face_outer_loop_polyline(
+    solid: &Solid,
+    face: FaceId,
+    tolerance: f64,
+) -> Result<Vec<Vec2>, BooleanError> {
+    let outer_loop = solid.faces[face]
+        .trim_loops
+        .iter()
+        .find(|trim_loop| trim_loop.kind == TrimLoopKind::Outer)
+        .ok_or(BooleanError::Unsupported)?;
+    let mut outer = trim_loop_polyline(outer_loop).ok_or(BooleanError::Unsupported)?;
+    cleanup_loop(&mut outer, tolerance);
+    if !polygon_is_usable(&outer, tolerance) {
+        return Err(BooleanError::Unsupported);
+    }
+    if polygon_signed_area(&outer) < 0.0 {
+        outer.reverse();
+    }
+    Ok(outer)
+}
+
+fn classify_point_against_operand(
+    solid: &Solid,
+    face_operands: &[BooleanOperand],
+    operand: BooleanOperand,
+    point: Point3,
+    tolerance: f64,
+) -> BooleanRegionSide {
+    let ray = Vec3::new(0.873_217, 0.371_391, 0.317_173).normalized();
+    let mut hits = Vec::<f64>::new();
+    for (face, face_operand) in face_operands.iter().copied().enumerate() {
+        if face_operand != operand {
+            continue;
+        }
+        let Some(triangle) = face_triangle(solid, face) else {
+            return BooleanRegionSide::Ambiguous;
+        };
+        if point_triangle_distance(point, &triangle) <= tolerance {
+            return BooleanRegionSide::Ambiguous;
+        }
+        if let Some(t) = ray_triangle_intersection(point, ray, &triangle, tolerance) {
+            push_unique_scalar(&mut hits, t, tolerance.max(1.0e-8));
+        }
+    }
+    if hits.len() % 2 == 1 {
+        BooleanRegionSide::InsideOther
+    } else {
+        BooleanRegionSide::OutsideOther
+    }
+}
+
+fn ray_triangle_intersection(
+    origin: Point3,
+    direction: Vec3,
+    triangle: &[Point3; 3],
+    tolerance: f64,
+) -> Option<f64> {
+    let edge1 = triangle[1] - triangle[0];
+    let edge2 = triangle[2] - triangle[0];
+    let h = direction.cross(edge2);
+    let det = edge1.dot(h);
+    if det.abs() <= tolerance {
+        return None;
+    }
+    let inv_det = 1.0 / det;
+    let s = origin - triangle[0];
+    let u = inv_det * s.dot(h);
+    if u < -tolerance || u > 1.0 + tolerance {
+        return None;
+    }
+    let q = s.cross(edge1);
+    let v = inv_det * direction.dot(q);
+    if v < -tolerance || u + v > 1.0 + tolerance {
+        return None;
+    }
+    let t = inv_det * edge2.dot(q);
+    if t > tolerance {
+        Some(t)
+    } else {
+        None
+    }
+}
+
+fn operand_subset_is_closed(
+    solid: &Solid,
+    face_operands: &[BooleanOperand],
+    operand: BooleanOperand,
+) -> bool {
+    let mut has_face = false;
+    for (face, face_operand) in face_operands.iter().copied().enumerate() {
+        if face_operand != operand {
+            continue;
+        }
+        has_face = true;
+        let start = solid.faces[face].halfedge;
+        let mut halfedge = start;
+        let mut guard = 0;
+        loop {
+            let Some(twin) = solid.halfedges[halfedge].twin else {
+                return false;
+            };
+            if face_operands[solid.halfedges[twin].face] != operand {
+                return false;
+            }
+            halfedge = solid.halfedges[halfedge].next;
+            guard += 1;
+            if halfedge == start {
+                break;
+            }
+            if guard > solid.halfedges.len() {
+                return false;
+            }
+        }
+    }
+    has_face
+}
+
+fn operand_has_faces(face_operands: &[BooleanOperand], operand: BooleanOperand) -> bool {
+    face_operands.contains(&operand)
+}
+
+fn other_operand(operand: BooleanOperand) -> BooleanOperand {
+    match operand {
+        BooleanOperand::Left => BooleanOperand::Right,
+        BooleanOperand::Right => BooleanOperand::Left,
+    }
+}
+
+fn operand_index(operand: BooleanOperand) -> usize {
+    match operand {
+        BooleanOperand::Left => 0,
+        BooleanOperand::Right => 1,
+    }
+}
+
+fn polygon_is_usable(points: &[Vec2], tolerance: f64) -> bool {
+    points.len() >= 3 && polygon_signed_area(points).abs() > tolerance * tolerance
+}
+
+fn polygon_centroid(points: &[Vec2]) -> Vec2 {
+    let mut twice_area = 0.0;
+    let mut centroid = Vec2::new(0.0, 0.0);
+    for index in 0..points.len() {
+        let a = points[index];
+        let b = points[(index + 1) % points.len()];
+        let cross = a.cross(b);
+        twice_area += cross;
+        centroid = centroid + (a + b) * cross;
+    }
+    if twice_area.abs() <= f64::EPSILON {
+        let sum = points
+            .iter()
+            .copied()
+            .fold(Vec2::new(0.0, 0.0), |acc, point| acc + point);
+        sum * (1.0 / points.len() as f64)
+    } else {
+        centroid * (1.0 / (3.0 * twice_area))
+    }
+}
+
+fn push_unique_polygon(polygons: &mut Vec<Vec<Vec2>>, mut polygon: Vec<Vec2>, tolerance: f64) {
+    cleanup_loop(&mut polygon, tolerance);
+    if !polygon_is_usable(&polygon, tolerance) {
+        return;
+    }
+    if polygons
+        .iter()
+        .any(|existing| polygons_are_equivalent(existing, &polygon, tolerance))
+    {
+        return;
+    }
+    polygons.push(polygon);
+}
+
+fn polygons_are_equivalent(a: &[Vec2], b: &[Vec2], tolerance: f64) -> bool {
+    (polygon_signed_area(a).abs() - polygon_signed_area(b).abs()).abs() <= tolerance * tolerance
+        && vec2_distance(polygon_centroid(a), polygon_centroid(b)) <= tolerance
+}
+
+fn push_unique_scalar(values: &mut Vec<f64>, value: f64, tolerance: f64) {
+    if values
+        .iter()
+        .all(|existing| (*existing - value).abs() > tolerance)
+    {
+        values.push(value);
+    }
 }
 
 fn action_for_side(
@@ -1887,6 +2452,15 @@ fn push_unique_uv(points: &mut Vec<Vec2>, point: Vec2) {
     if points
         .last()
         .is_none_or(|last| vec2_distance(*last, point) > 1.0e-12)
+    {
+        points.push(point);
+    }
+}
+
+fn push_unique_uv_with_tolerance(points: &mut Vec<Vec2>, point: Vec2, tolerance: f64) {
+    if points
+        .last()
+        .is_none_or(|last| vec2_distance(*last, point) > tolerance)
     {
         points.push(point);
     }
