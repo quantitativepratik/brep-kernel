@@ -7,9 +7,15 @@
 //! keep/discard side decisions before a later trim-healing pass rewrites the
 //! shell topology.
 
+use crate::geometry::Plane;
+use crate::intersection::{
+    intersect_nurbs_surfaces, intersect_plane_nurbs_surface, IntersectionPolyline,
+    TrimReadyIntersectionCurve,
+};
 use crate::math::{Point3, Vec2, Vec3};
 use crate::topology::{
-    FaceId, SewingReport, Solid, SplitEdgeId, TopologyError, TrimCurve2D, TrimLoopKind,
+    EdgeCurve3D, FaceId, FaceSurface, SewingReport, Solid, SplitEdgeId, TopologyError, TrimCurve2D,
+    TrimLoopKind,
 };
 
 /// Boolean operation.
@@ -215,6 +221,121 @@ pub struct BooleanReport {
     pub euler_characteristic: isize,
     /// Genus estimate.
     pub genus: Option<isize>,
+}
+
+/// Relationship found for one left/right face pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BooleanFacePairStatus {
+    /// The two finite faces do not intersect.
+    Disjoint,
+    /// The faces touch at a point or along a numerically tiny interval.
+    Touching,
+    /// The faces intersect in one or more curves.
+    Intersecting,
+    /// The faces are coplanar or coincident over an area.
+    Coincident,
+    /// The pair could not be intersected with the available representation.
+    Unsupported,
+}
+
+/// One intersection curve/segment recorded in the face-pair graph.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BooleanFaceIntersectionCurve {
+    /// Model-space samples on the curve.
+    pub points: Vec<Point3>,
+    /// Model-space curve for downstream split installation.
+    pub edge_curve: EdgeCurve3D,
+    /// P-curve on the left face when available.
+    pub left_pcurve: Option<TrimCurve2D>,
+    /// P-curve on the right face when available.
+    pub right_pcurve: Option<TrimCurve2D>,
+    /// Trim-ready SSI curve when a supported analytic path produced one.
+    pub trim_ready: Option<TrimReadyIntersectionCurve>,
+    /// Maximum residual reported by the intersection routine.
+    pub max_residual: f64,
+}
+
+/// Intersection record for one pair of faces, one from each operand.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BooleanFacePairIntersection {
+    /// Face index in the left operand.
+    pub left_face: FaceId,
+    /// Face index in the right operand.
+    pub right_face: FaceId,
+    /// Pair status.
+    pub status: BooleanFacePairStatus,
+    /// Curve or segment intersections for this pair.
+    pub curves: Vec<BooleanFaceIntersectionCurve>,
+    /// Largest curve residual for this pair.
+    pub max_residual: f64,
+}
+
+/// Full face-pair intersection graph between two solids.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BooleanIntersectionGraph {
+    /// Intersection tolerance in model units.
+    pub tolerance: f64,
+    /// Number of faces in the left operand.
+    pub left_face_count: usize,
+    /// Number of faces in the right operand.
+    pub right_face_count: usize,
+    /// One record for every left/right face pair.
+    pub face_pairs: Vec<BooleanFacePairIntersection>,
+    /// Indices into `face_pairs` for non-empty pairs adjacent to each left face.
+    pub left_adjacency: Vec<Vec<usize>>,
+    /// Indices into `face_pairs` for non-empty pairs adjacent to each right face.
+    pub right_adjacency: Vec<Vec<usize>>,
+    /// Number of non-empty face pairs.
+    pub active_pair_count: usize,
+    /// Total number of intersection curves across active pairs.
+    pub curve_count: usize,
+}
+
+/// Intersect every face pair across two solids and build a face-pair graph.
+pub fn build_face_intersection_graph(
+    left: &Solid,
+    right: &Solid,
+    tolerance: f64,
+) -> Result<BooleanIntersectionGraph, BooleanError> {
+    if !tolerance.is_finite() || tolerance < 0.0 {
+        return Err(BooleanError::InvalidInput("tolerance must be nonnegative"));
+    }
+    left.validate()?;
+    right.validate()?;
+    let tolerance = tolerance.max(1.0e-9);
+    let mut face_pairs = Vec::with_capacity(left.faces.len() * right.faces.len());
+    let mut left_adjacency = vec![Vec::<usize>::new(); left.faces.len()];
+    let mut right_adjacency = vec![Vec::<usize>::new(); right.faces.len()];
+    let mut active_pair_count = 0;
+    let mut curve_count = 0;
+
+    for (left_face, left_pairs) in left_adjacency.iter_mut().enumerate() {
+        for (right_face, right_pairs) in right_adjacency.iter_mut().enumerate() {
+            let record = intersect_face_pair(left, right, left_face, right_face, tolerance);
+            let pair_index = face_pairs.len();
+            if !matches!(
+                record.status,
+                BooleanFacePairStatus::Disjoint | BooleanFacePairStatus::Unsupported
+            ) {
+                active_pair_count += 1;
+                left_pairs.push(pair_index);
+                right_pairs.push(pair_index);
+            }
+            curve_count += record.curves.len();
+            face_pairs.push(record);
+        }
+    }
+
+    Ok(BooleanIntersectionGraph {
+        tolerance,
+        left_face_count: left.faces.len(),
+        right_face_count: right.faces.len(),
+        face_pairs,
+        left_adjacency,
+        right_adjacency,
+        active_pair_count,
+        curve_count,
+    })
 }
 
 /// Classify staged face splits into Boolean keep/discard side decisions.
@@ -428,6 +549,592 @@ pub fn subtract_cube_cylinder(
 fn push_point(points: &mut Vec<Point3>, point: Point3) -> usize {
     points.push(point);
     points.len() - 1
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TriangleFaceIntersection {
+    Disjoint,
+    Touching(Point3),
+    Segment {
+        start: Point3,
+        end: Point3,
+        max_residual: f64,
+    },
+    Coincident,
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TrianglePlaneCut {
+    Point(Point3),
+    Segment { start: Point3, end: Point3 },
+}
+
+fn intersect_face_pair(
+    left: &Solid,
+    right: &Solid,
+    left_face: FaceId,
+    right_face: FaceId,
+    tolerance: f64,
+) -> BooleanFacePairIntersection {
+    let mut curves = analytic_face_pair_curves(left, right, left_face, right_face, tolerance);
+    let mut status = if curves.is_empty() {
+        BooleanFacePairStatus::Disjoint
+    } else {
+        BooleanFacePairStatus::Intersecting
+    };
+
+    if curves.is_empty() {
+        match intersect_triangle_faces(left, right, left_face, right_face, tolerance) {
+            TriangleFaceIntersection::Disjoint => status = BooleanFacePairStatus::Disjoint,
+            TriangleFaceIntersection::Touching(_) => status = BooleanFacePairStatus::Touching,
+            TriangleFaceIntersection::Segment {
+                start,
+                end,
+                max_residual,
+            } => {
+                status = BooleanFacePairStatus::Intersecting;
+                if let Some(curve) = graph_curve_from_points(
+                    vec![start, end],
+                    &left.faces[left_face].surface,
+                    &right.faces[right_face].surface,
+                    tolerance,
+                    max_residual,
+                ) {
+                    curves.push(curve);
+                }
+            }
+            TriangleFaceIntersection::Coincident => status = BooleanFacePairStatus::Coincident,
+            TriangleFaceIntersection::Unsupported => status = BooleanFacePairStatus::Unsupported,
+        }
+    }
+
+    let max_residual = curves
+        .iter()
+        .map(|curve| curve.max_residual)
+        .fold(0.0_f64, f64::max);
+    BooleanFacePairIntersection {
+        left_face,
+        right_face,
+        status,
+        curves,
+        max_residual,
+    }
+}
+
+fn analytic_face_pair_curves(
+    left: &Solid,
+    right: &Solid,
+    left_face: FaceId,
+    right_face: FaceId,
+    tolerance: f64,
+) -> Vec<BooleanFaceIntersectionCurve> {
+    let left_surface = &left.faces[left_face].surface;
+    let right_surface = &right.faces[right_face].surface;
+    let mut curves = match (left_surface, right_surface) {
+        (FaceSurface::Nurbs(left_nurbs), FaceSurface::Nurbs(right_nurbs)) => {
+            intersect_nurbs_surfaces(left_nurbs, right_nurbs, 24, 24, tolerance)
+                .into_iter()
+                .map(trim_ready_curve_to_graph_curve)
+                .collect()
+        }
+        (FaceSurface::Plane(plane), FaceSurface::Nurbs(nurbs)) => {
+            intersect_plane_nurbs_surface(*plane, nurbs, 32, 32, tolerance)
+                .into_iter()
+                .filter_map(|polyline| {
+                    graph_curve_from_polyline(polyline, left_surface, right_surface, tolerance)
+                })
+                .collect()
+        }
+        (FaceSurface::Nurbs(nurbs), FaceSurface::Plane(plane)) => {
+            intersect_plane_nurbs_surface(*plane, nurbs, 32, 32, tolerance)
+                .into_iter()
+                .filter_map(|polyline| {
+                    graph_curve_from_polyline(polyline, left_surface, right_surface, tolerance)
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    curves.retain(|curve| {
+        graph_curve_intersects_face_domains(left, right, left_face, right_face, curve, tolerance)
+    });
+    curves
+}
+
+fn trim_ready_curve_to_graph_curve(
+    curve: TrimReadyIntersectionCurve,
+) -> BooleanFaceIntersectionCurve {
+    let points = curve
+        .points
+        .iter()
+        .map(|sample| sample.point)
+        .collect::<Vec<_>>();
+    BooleanFaceIntersectionCurve {
+        points,
+        edge_curve: curve.edge_curve.clone(),
+        left_pcurve: Some(curve.a_pcurve.clone()),
+        right_pcurve: Some(curve.b_pcurve.clone()),
+        max_residual: curve.max_residual,
+        trim_ready: Some(curve),
+    }
+}
+
+fn graph_curve_from_polyline(
+    polyline: IntersectionPolyline,
+    left_surface: &FaceSurface,
+    right_surface: &FaceSurface,
+    tolerance: f64,
+) -> Option<BooleanFaceIntersectionCurve> {
+    graph_curve_from_points(
+        polyline.points,
+        left_surface,
+        right_surface,
+        tolerance,
+        polyline.max_residual,
+    )
+}
+
+fn graph_curve_from_points(
+    points: Vec<Point3>,
+    left_surface: &FaceSurface,
+    right_surface: &FaceSurface,
+    tolerance: f64,
+    max_residual: f64,
+) -> Option<BooleanFaceIntersectionCurve> {
+    if points.len() < 2 {
+        return None;
+    }
+    let edge_curve = edge_curve_from_points(&points, tolerance)?;
+    let left_pcurve = pcurve_from_model_points(left_surface, &points, tolerance);
+    let right_pcurve = pcurve_from_model_points(right_surface, &points, tolerance);
+    Some(BooleanFaceIntersectionCurve {
+        points,
+        edge_curve,
+        left_pcurve,
+        right_pcurve,
+        trim_ready: None,
+        max_residual,
+    })
+}
+
+fn edge_curve_from_points(points: &[Point3], tolerance: f64) -> Option<EdgeCurve3D> {
+    let start = *points.first()?;
+    let end = *points.last()?;
+    if start.distance(end) <= tolerance {
+        return None;
+    }
+    if points.len() == 2 {
+        Some(EdgeCurve3D::line_segment(start, end))
+    } else {
+        Some(EdgeCurve3D::Polyline {
+            points: points.to_vec(),
+        })
+    }
+}
+
+fn pcurve_from_model_points(
+    surface: &FaceSurface,
+    points: &[Point3],
+    tolerance: f64,
+) -> Option<TrimCurve2D> {
+    let mut uv_points = Vec::with_capacity(points.len());
+    let mut seed = None;
+    for point in points {
+        let uv = surface.project_point_near(*point, seed, tolerance.max(1.0e-7))?;
+        seed = Some(uv);
+        if uv_points
+            .last()
+            .is_none_or(|last| vec2_distance(*last, uv) > tolerance)
+        {
+            uv_points.push(uv);
+        }
+    }
+    if uv_points.len() < 2 {
+        return None;
+    }
+    if uv_points.len() == 2 {
+        Some(TrimCurve2D::LineSegment {
+            start: uv_points[0],
+            end: uv_points[1],
+        })
+    } else {
+        Some(TrimCurve2D::Polyline { points: uv_points })
+    }
+}
+
+fn graph_curve_intersects_face_domains(
+    left: &Solid,
+    right: &Solid,
+    left_face: FaceId,
+    right_face: FaceId,
+    curve: &BooleanFaceIntersectionCurve,
+    tolerance: f64,
+) -> bool {
+    let left_ok = curve
+        .left_pcurve
+        .as_ref()
+        .is_none_or(|pcurve| pcurve_samples_visible_on_face(left, left_face, pcurve, tolerance));
+    let right_ok = curve
+        .right_pcurve
+        .as_ref()
+        .is_none_or(|pcurve| pcurve_samples_visible_on_face(right, right_face, pcurve, tolerance));
+    left_ok && right_ok
+}
+
+fn pcurve_samples_visible_on_face(
+    solid: &Solid,
+    face: FaceId,
+    pcurve: &TrimCurve2D,
+    tolerance: f64,
+) -> bool {
+    let Some(samples) = sample_pcurve_points(pcurve) else {
+        return true;
+    };
+    samples.into_iter().any(|uv| {
+        matches!(
+            classify_face_uv(solid, face, uv, tolerance),
+            Some(LoopPointLocation::Inside | LoopPointLocation::Boundary)
+        )
+    })
+}
+
+fn intersect_triangle_faces(
+    left: &Solid,
+    right: &Solid,
+    left_face: FaceId,
+    right_face: FaceId,
+    tolerance: f64,
+) -> TriangleFaceIntersection {
+    let Some(left_triangle) = face_triangle(left, left_face) else {
+        return TriangleFaceIntersection::Unsupported;
+    };
+    let Some(right_triangle) = face_triangle(right, right_face) else {
+        return TriangleFaceIntersection::Unsupported;
+    };
+    if !triangle_bounds_overlap(&left_triangle, &right_triangle, tolerance) {
+        return TriangleFaceIntersection::Disjoint;
+    }
+
+    let Some(left_plane) = Plane::from_points(left_triangle[0], left_triangle[1], left_triangle[2])
+    else {
+        return TriangleFaceIntersection::Unsupported;
+    };
+    let Some(right_plane) =
+        Plane::from_points(right_triangle[0], right_triangle[1], right_triangle[2])
+    else {
+        return TriangleFaceIntersection::Unsupported;
+    };
+    let eps = tolerance.max(1.0e-12);
+    let left_to_right = triangle_signed_distances(&left_triangle, right_plane);
+    if distances_are_strictly_one_sided(left_to_right, eps) {
+        return TriangleFaceIntersection::Disjoint;
+    }
+    let right_to_left = triangle_signed_distances(&right_triangle, left_plane);
+    if distances_are_strictly_one_sided(right_to_left, eps) {
+        return TriangleFaceIntersection::Disjoint;
+    }
+
+    let line_direction = left_plane.normal.cross(right_plane.normal);
+    if line_direction.norm() <= eps {
+        let coplanar = left_to_right.iter().all(|distance| distance.abs() <= eps)
+            && right_to_left.iter().all(|distance| distance.abs() <= eps);
+        return if coplanar
+            && coplanar_triangles_overlap(&left_triangle, &right_triangle, left_plane.normal, eps)
+        {
+            TriangleFaceIntersection::Coincident
+        } else {
+            TriangleFaceIntersection::Disjoint
+        };
+    }
+
+    let Some(left_cut) = cut_triangle_with_plane(&left_triangle, left_to_right, eps) else {
+        return TriangleFaceIntersection::Disjoint;
+    };
+    let Some(right_cut) = cut_triangle_with_plane(&right_triangle, right_to_left, eps) else {
+        return TriangleFaceIntersection::Disjoint;
+    };
+    let axis = line_direction.normalized();
+    let (left_min, left_max) = cut_interval(left_cut, axis);
+    let (right_min, right_max) = cut_interval(right_cut, axis);
+    let overlap_min = left_min.max(right_min);
+    let overlap_max = left_max.min(right_max);
+    if overlap_max < overlap_min - eps {
+        return TriangleFaceIntersection::Disjoint;
+    }
+    if (overlap_max - overlap_min).abs() <= eps {
+        let point = point_on_cut_at(left_cut, axis, (overlap_min + overlap_max) * 0.5);
+        return TriangleFaceIntersection::Touching(point);
+    }
+
+    let start = point_on_cut_at(left_cut, axis, overlap_min);
+    let end = point_on_cut_at(left_cut, axis, overlap_max);
+    if start.distance(end) <= eps {
+        TriangleFaceIntersection::Touching((start + end) * 0.5)
+    } else {
+        TriangleFaceIntersection::Segment {
+            start,
+            end,
+            max_residual: max_triangle_residual(
+                start,
+                end,
+                left_plane,
+                right_plane,
+                left_triangle,
+                right_triangle,
+            ),
+        }
+    }
+}
+
+fn face_triangle(solid: &Solid, face: FaceId) -> Option<[Point3; 3]> {
+    if face >= solid.faces.len() {
+        return None;
+    }
+    let vertices = solid.face_vertices(face);
+    Some([
+        solid.vertices.get(vertices[0])?.point,
+        solid.vertices.get(vertices[1])?.point,
+        solid.vertices.get(vertices[2])?.point,
+    ])
+}
+
+fn triangle_signed_distances(triangle: &[Point3; 3], plane: Plane) -> [f64; 3] {
+    [
+        plane.signed_distance(triangle[0]),
+        plane.signed_distance(triangle[1]),
+        plane.signed_distance(triangle[2]),
+    ]
+}
+
+fn distances_are_strictly_one_sided(distances: [f64; 3], tolerance: f64) -> bool {
+    distances.iter().all(|distance| *distance > tolerance)
+        || distances.iter().all(|distance| *distance < -tolerance)
+}
+
+fn cut_triangle_with_plane(
+    triangle: &[Point3; 3],
+    distances: [f64; 3],
+    tolerance: f64,
+) -> Option<TrianglePlaneCut> {
+    let mut points = Vec::<Point3>::new();
+    for index in 0..3 {
+        if distances[index].abs() <= tolerance {
+            push_unique_point3(&mut points, triangle[index], tolerance);
+        }
+        let next = (index + 1) % 3;
+        let a = distances[index];
+        let b = distances[next];
+        if (a > tolerance && b < -tolerance) || (a < -tolerance && b > tolerance) {
+            let t = a / (a - b);
+            push_unique_point3(
+                &mut points,
+                triangle[index].lerp(triangle[next], t),
+                tolerance,
+            );
+        }
+    }
+    match points.len() {
+        0 => None,
+        1 => Some(TrianglePlaneCut::Point(points[0])),
+        _ => {
+            let (start, end) = furthest_point_pair(&points);
+            if start.distance(end) <= tolerance {
+                Some(TrianglePlaneCut::Point(start))
+            } else {
+                Some(TrianglePlaneCut::Segment { start, end })
+            }
+        }
+    }
+}
+
+fn cut_interval(cut: TrianglePlaneCut, axis: Vec3) -> (f64, f64) {
+    match cut {
+        TrianglePlaneCut::Point(point) => {
+            let t = point.dot(axis);
+            (t, t)
+        }
+        TrianglePlaneCut::Segment { start, end } => {
+            let a = start.dot(axis);
+            let b = end.dot(axis);
+            (a.min(b), a.max(b))
+        }
+    }
+}
+
+fn point_on_cut_at(cut: TrianglePlaneCut, axis: Vec3, target: f64) -> Point3 {
+    match cut {
+        TrianglePlaneCut::Point(point) => point,
+        TrianglePlaneCut::Segment { start, end } => {
+            let a = start.dot(axis);
+            let b = end.dot(axis);
+            let denom = b - a;
+            if denom.abs() <= f64::EPSILON {
+                (start + end) * 0.5
+            } else {
+                start.lerp(end, ((target - a) / denom).clamp(0.0, 1.0))
+            }
+        }
+    }
+}
+
+fn max_triangle_residual(
+    start: Point3,
+    end: Point3,
+    left_plane: Plane,
+    right_plane: Plane,
+    left_triangle: [Point3; 3],
+    right_triangle: [Point3; 3],
+) -> f64 {
+    [start, end]
+        .into_iter()
+        .map(|point| {
+            left_plane
+                .signed_distance(point)
+                .abs()
+                .max(right_plane.signed_distance(point).abs())
+                .max(point_triangle_distance(point, &left_triangle))
+                .max(point_triangle_distance(point, &right_triangle))
+        })
+        .fold(0.0_f64, f64::max)
+}
+
+fn triangle_bounds_overlap(a: &[Point3; 3], b: &[Point3; 3], tolerance: f64) -> bool {
+    let (a_min, a_max) = triangle_bounds(a);
+    let (b_min, b_max) = triangle_bounds(b);
+    a_min.x <= b_max.x + tolerance
+        && a_max.x + tolerance >= b_min.x
+        && a_min.y <= b_max.y + tolerance
+        && a_max.y + tolerance >= b_min.y
+        && a_min.z <= b_max.z + tolerance
+        && a_max.z + tolerance >= b_min.z
+}
+
+fn triangle_bounds(triangle: &[Point3; 3]) -> (Point3, Point3) {
+    let mut min = triangle[0];
+    let mut max = triangle[0];
+    for point in triangle.iter().skip(1) {
+        min.x = min.x.min(point.x);
+        min.y = min.y.min(point.y);
+        min.z = min.z.min(point.z);
+        max.x = max.x.max(point.x);
+        max.y = max.y.max(point.y);
+        max.z = max.z.max(point.z);
+    }
+    (min, max)
+}
+
+fn coplanar_triangles_overlap(
+    a: &[Point3; 3],
+    b: &[Point3; 3],
+    normal: Vec3,
+    tolerance: f64,
+) -> bool {
+    let a2 = [
+        project_coplanar_point(a[0], normal),
+        project_coplanar_point(a[1], normal),
+        project_coplanar_point(a[2], normal),
+    ];
+    let b2 = [
+        project_coplanar_point(b[0], normal),
+        project_coplanar_point(b[1], normal),
+        project_coplanar_point(b[2], normal),
+    ];
+    !has_separating_axis_2d(&a2, &b2, tolerance) && !has_separating_axis_2d(&b2, &a2, tolerance)
+}
+
+fn has_separating_axis_2d(a: &[Vec2; 3], b: &[Vec2; 3], tolerance: f64) -> bool {
+    for index in 0..3 {
+        let edge = a[(index + 1) % 3] - a[index];
+        let axis = Vec2::new(-edge.y, edge.x);
+        let (a_min, a_max) = projected_interval_2d(a, axis);
+        let (b_min, b_max) = projected_interval_2d(b, axis);
+        if a_max < b_min - tolerance || b_max < a_min - tolerance {
+            return true;
+        }
+    }
+    false
+}
+
+fn projected_interval_2d(points: &[Vec2; 3], axis: Vec2) -> (f64, f64) {
+    let mut min = points[0].dot(axis);
+    let mut max = min;
+    for point in points.iter().skip(1) {
+        let t = point.dot(axis);
+        min = min.min(t);
+        max = max.max(t);
+    }
+    (min, max)
+}
+
+fn project_coplanar_point(point: Point3, normal: Vec3) -> Vec2 {
+    let ax = normal.x.abs();
+    let ay = normal.y.abs();
+    let az = normal.z.abs();
+    if ax >= ay && ax >= az {
+        Vec2::new(point.y, point.z)
+    } else if ay >= az {
+        Vec2::new(point.x, point.z)
+    } else {
+        Vec2::new(point.x, point.y)
+    }
+}
+
+fn point_triangle_distance(point: Point3, triangle: &[Point3; 3]) -> f64 {
+    let Some(plane) = Plane::from_points(triangle[0], triangle[1], triangle[2]) else {
+        return f64::INFINITY;
+    };
+    let projected = plane.project(point);
+    if point_in_triangle_3d(projected, triangle, plane.normal) {
+        point.distance(projected)
+    } else {
+        point_segment_distance3(point, triangle[0], triangle[1])
+            .min(point_segment_distance3(point, triangle[1], triangle[2]))
+            .min(point_segment_distance3(point, triangle[2], triangle[0]))
+    }
+}
+
+fn point_in_triangle_3d(point: Point3, triangle: &[Point3; 3], normal: Vec3) -> bool {
+    let a = triangle[0];
+    let b = triangle[1];
+    let c = triangle[2];
+    normal.dot((b - a).cross(point - a)) >= -1.0e-9
+        && normal.dot((c - b).cross(point - b)) >= -1.0e-9
+        && normal.dot((a - c).cross(point - c)) >= -1.0e-9
+}
+
+fn point_segment_distance3(point: Point3, a: Point3, b: Point3) -> f64 {
+    let edge = b - a;
+    let len2 = edge.dot(edge);
+    if len2 <= f64::EPSILON {
+        return point.distance(a);
+    }
+    let t = ((point - a).dot(edge) / len2).clamp(0.0, 1.0);
+    point.distance(a + edge * t)
+}
+
+fn furthest_point_pair(points: &[Point3]) -> (Point3, Point3) {
+    let mut best = (points[0], points[0]);
+    let mut best_distance = 0.0;
+    for (i, a) in points.iter().enumerate() {
+        for b in points.iter().skip(i + 1) {
+            let distance = a.distance(*b);
+            if distance > best_distance {
+                best_distance = distance;
+                best = (*a, *b);
+            }
+        }
+    }
+    best
+}
+
+fn push_unique_point3(points: &mut Vec<Point3>, point: Point3, tolerance: f64) {
+    if points
+        .iter()
+        .all(|existing| existing.distance(point) > tolerance)
+    {
+        points.push(point);
+    }
 }
 
 fn push_healed_regions_for_face(

@@ -63,6 +63,8 @@ The result is fed through the same half-edge constructor as every other solid. T
 
 For the general Boolean pipeline, `classify_split_faces` consumes staged topology splits. It samples each split p-curve against the face's trim domain, uses local surface partials and the opposite face normal to classify the UV-left and UV-right sides as inside or outside the opposite operand, then maps those sides to Union/Intersect/Subtract actions.
 
+Before classification, `build_face_intersection_graph` now provides the all-pairs discovery layer. It validates both operands, intersects every left/right face pair, records a status for every pair including disjoint pairs, and builds left/right adjacency lists for non-empty pairs. Supported analytic pairs reuse the NURBS SSI routines and carry trim-ready 3D/p-curve data; general current half-edge solids use a finite triangle-triangle fallback that emits line-segment curve records with p-curves projected onto each face support.
+
 `heal_classified_split_faces` promotes the supported subset of those decisions into output geometry. For a boundary-to-boundary split on a polyline-trimmable face, it walks the outer trim boundary, builds the kept trim loop for the requested side, evaluates the loop back onto the analytic face, triangulates the healed region, runs tolerance-aware sewing, and tries to validate the result as a new half-edge `Solid`. If the regions are only a partial shell, the caller still receives the healed regions and mesh plus the topology validation error.
 
 ## GPU And Browser
