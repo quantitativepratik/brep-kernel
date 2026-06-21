@@ -27,6 +27,7 @@ let pitch = 0.55;
 let distance = 4.7;
 let dragging = false;
 let lastPointer = [0, 0];
+let patchBuildToken = 0;
 
 const renderShader = `
 struct Uniforms {
@@ -126,7 +127,7 @@ async function main() {
 }
 
 async function buildPatchResources() {
-  const shaderCode = await fetch("../assets/shaders/nurbs_tessellate.wgsl").then((r) => r.text());
+  const shaderCode = await fetch("../assets/shaders/nurbs_tessellate.wgsl", { cache: "no-store" }).then((r) => r.text());
   const computeModule = device.createShaderModule({ code: shaderCode });
   computePipeline = device.createComputePipeline({
     layout: "auto",
@@ -136,7 +137,7 @@ async function buildPatchResources() {
   const control = rationalPatchControl();
   controlBuffer = device.createBuffer({
     size: control.byteLength,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
   device.queue.writeBuffer(controlBuffer, 0, control);
 
@@ -162,39 +163,72 @@ async function setMode(nextMode) {
 }
 
 async function rebuildPatch() {
+  const token = ++patchBuildToken;
   const steps = Number(gridSlider.value);
   const row = steps + 1;
   const vertices = row * row;
-  vertexBuffer = device.createBuffer({
-    size: vertices * 32,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-  });
-  indexBuffer = device.createBuffer({
-    size: steps * steps * 6 * 4,
-    usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
-  });
   const indices = gridIndices(steps, steps);
-  device.queue.writeBuffer(indexBuffer, 0, indices);
-  indexCount = indices.length;
-  vertexCount = vertices;
-  drawIndexed = true;
+  const triangles = Math.floor(indices.length / 3);
+  const cpuGrid = buildPatchVertices(steps);
+  const cpuTriangles = expandIndexedVertices(cpuGrid, indices);
+  vertexBuffer = device.createBuffer({
+    size: cpuTriangles.byteLength,
+    usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(vertexBuffer, 0, cpuTriangles);
+  const computeVertexBuffer = device.createBuffer({
+    size: vertices * 32,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+  });
+  device.queue.writeBuffer(computeVertexBuffer, 0, cpuGrid);
+  indexBuffer = undefined;
+  indexCount = 0;
+  vertexCount = cpuTriangles.length / 8;
+  drawIndexed = false;
   device.queue.writeBuffer(paramsBuffer, 0, new Uint32Array([steps, steps, 0, 0]));
   computeBindGroup = device.createBindGroup({
     layout: computePipeline.getBindGroupLayout(0),
     entries: [
       { binding: 0, resource: { buffer: controlBuffer } },
-      { binding: 1, resource: { buffer: vertexBuffer } },
+      { binding: 1, resource: { buffer: computeVertexBuffer } },
       { binding: 2, resource: { buffer: paramsBuffer } },
     ],
   });
-  const encoder = device.createCommandEncoder();
-  const pass = encoder.beginComputePass();
-  pass.setPipeline(computePipeline);
-  pass.setBindGroup(0, computeBindGroup);
-  pass.dispatchWorkgroups(Math.ceil(row / 8), Math.ceil(row / 8));
-  pass.end();
-  device.queue.submit([encoder.finish()]);
-  stats.textContent = `${vertices.toLocaleString()} vertices, ${Math.floor(indexCount / 3).toLocaleString()} triangles`;
+  stats.textContent = `${vertices.toLocaleString()} vertices, ${triangles.toLocaleString()} triangles`;
+  try {
+    const readback = device.createBuffer({
+      size: vertices * 32,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    });
+    const encoder = device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(computePipeline);
+    pass.setBindGroup(0, computeBindGroup);
+    pass.dispatchWorkgroups(Math.ceil(row / 8), Math.ceil(row / 8));
+    pass.end();
+    encoder.copyBufferToBuffer(computeVertexBuffer, 0, readback, 0, vertices * 32);
+    device.queue.submit([encoder.finish()]);
+    await readback.mapAsync(GPUMapMode.READ);
+    const generated = new Float32Array(readback.getMappedRange()).slice();
+    readback.unmap();
+    if (token !== patchBuildToken) {
+      return;
+    }
+    if (!patchBufferLooksDrawable(generated)) {
+      device.queue.writeBuffer(vertexBuffer, 0, cpuTriangles);
+      stats.textContent = `${vertices.toLocaleString()} vertices, ${triangles.toLocaleString()} triangles · CPU fallback`;
+      console.warn("WGSL NURBS tessellation produced a non-drawable buffer; using CPU fallback vertices.");
+    } else {
+      device.queue.writeBuffer(vertexBuffer, 0, expandIndexedVertices(generated, indices));
+    }
+  } catch (error) {
+    if (token !== patchBuildToken) {
+      return;
+    }
+    device.queue.writeBuffer(vertexBuffer, 0, cpuTriangles);
+    stats.textContent = `${vertices.toLocaleString()} vertices, ${triangles.toLocaleString()} triangles · CPU fallback`;
+    console.warn("WGSL NURBS tessellation failed; using CPU fallback vertices.", error);
+  }
 }
 
 async function rebuildBoolean() {
@@ -412,6 +446,116 @@ function rationalPatchControl() {
     }
   }
   return out;
+}
+
+function buildPatchVertices(steps) {
+  const row = steps + 1;
+  const control = rationalPatchControl();
+  const out = new Float32Array(row * row * 8);
+  let k = 0;
+  for (let j = 0; j < row; j++) {
+    const v = j / Math.max(steps, 1);
+    for (let i = 0; i < row; i++) {
+      const u = i / Math.max(steps, 1);
+      const c = evalRationalPatch(control, u, v, false, false);
+      const cu = evalRationalPatch(control, u, v, true, false);
+      const cv = evalRationalPatch(control, u, v, false, true);
+      const invW = 1 / Math.max(c[3], 1.0e-8);
+      const p = [c[0] * invW, c[1] * invW, c[2] * invW];
+      const du = rationalDerivative(c, cu);
+      const dv = rationalDerivative(c, cv);
+      let n = normalize(cross(du, dv));
+      if (!n.every(Number.isFinite)) {
+        n = [0, 0, 1];
+      }
+      out[k++] = p[0];
+      out[k++] = p[1];
+      out[k++] = p[2];
+      out[k++] = 1;
+      out[k++] = n[0];
+      out[k++] = n[1];
+      out[k++] = n[2];
+      out[k++] = 0;
+    }
+  }
+  return out;
+}
+
+function patchBufferLooksDrawable(data) {
+  let finiteVertices = 0;
+  const min = [Infinity, Infinity, Infinity];
+  const max = [-Infinity, -Infinity, -Infinity];
+  for (let i = 0; i < data.length; i += 8) {
+    const p = [data[i], data[i + 1], data[i + 2]];
+    if (!p.every(Number.isFinite)) {
+      continue;
+    }
+    finiteVertices += 1;
+    for (let axis = 0; axis < 3; axis++) {
+      min[axis] = Math.min(min[axis], p[axis]);
+      max[axis] = Math.max(max[axis], p[axis]);
+    }
+  }
+  const span = Math.max(max[0] - min[0], max[1] - min[1], max[2] - min[2]);
+  return finiteVertices >= data.length / 8 * 0.95 && Number.isFinite(span) && span > 0.25;
+}
+
+function expandIndexedVertices(vertices, indices) {
+  const expanded = new Float32Array(indices.length * 8);
+  let k = 0;
+  for (const index of indices) {
+    const offset = index * 8;
+    for (let i = 0; i < 8; i++) {
+      expanded[k++] = vertices[offset + i];
+    }
+  }
+  return expanded;
+}
+
+function evalRationalPatch(control, u, v, du, dv) {
+  const bu = du ? dBernstein3(u) : bernstein3(u);
+  const bv = dv ? dBernstein3(v) : bernstein3(v);
+  const sum = [0, 0, 0, 0];
+  for (let j = 0; j < 4; j++) {
+    for (let i = 0; i < 4; i++) {
+      const basis = bu[i] * bv[j];
+      const offset = (j * 4 + i) * 4;
+      sum[0] += control[offset + 0] * basis;
+      sum[1] += control[offset + 1] * basis;
+      sum[2] += control[offset + 2] * basis;
+      sum[3] += control[offset + 3] * basis;
+    }
+  }
+  return sum;
+}
+
+function bernstein3(t) {
+  const omt = 1 - t;
+  return [
+    omt * omt * omt,
+    3 * t * omt * omt,
+    3 * t * t * omt,
+    t * t * t,
+  ];
+}
+
+function dBernstein3(t) {
+  const omt = 1 - t;
+  return [
+    -3 * omt * omt,
+    3 * omt * omt - 6 * t * omt,
+    6 * t * omt - 3 * t * t,
+    3 * t * t,
+  ];
+}
+
+function rationalDerivative(c, dc) {
+  const denom = Math.max(c[3] * c[3], 1.0e-8);
+  return [
+    (dc[0] * c[3] - c[0] * dc[3]) / denom,
+    (dc[1] * c[3] - c[1] * dc[3]) / denom,
+    (dc[2] * c[3] - c[2] * dc[3]) / denom,
+  ];
 }
 
 function gridIndices(uSteps, vSteps) {
