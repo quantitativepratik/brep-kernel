@@ -51,6 +51,10 @@ Knot insertion is implemented for curves as a shape-preserving refinement operat
 
 The current filter can certify many cases and explicitly reports uncertainty for degenerate ones. That is enough to prevent silent misclassification in the implemented operations.
 
+## Diagnostics
+
+`src/errors.rs` defines the structured error surface. `KernelError` carries a primary `KernelDiagnostic` plus related diagnostics. A diagnostic records severity, subsystem, broad error kind, stable code, message, operation, optional entity reference, source error text, and notes. Existing subsystem errors such as `TopologyError`, `BooleanError`, `EulerError`, `FeatureError`, and `NurbsError` can be converted into this richer form. New public layers such as exchange use `KernelResult<T>` directly so parse and validation failures retain machine-readable context.
+
 ## Intersections
 
 `src/intersection.rs` includes exact analytic intersections for linear primitives and marching/bracketing routines for NURBS cases.
@@ -76,6 +80,12 @@ Before classification, `build_face_intersection_graph` now provides the all-pair
 `heal_classified_split_faces` promotes the supported subset of those decisions into output geometry. For a boundary-to-boundary split on a polyline-trimmable face, it walks the outer trim boundary, builds the kept trim loop for the requested side, evaluates the loop back onto the analytic face, triangulates the healed region, and sends the mesh through `heal_boolean_triangle_mesh`. That repair stage clusters gap vertices, removes triangles collapsed by sewing, filters tiny-edge/sliver/duplicate triangles, compacts the mesh, and tries to validate the result as a new half-edge `Solid`. If arbitrary input still cannot be made manifold, the caller receives the repaired mesh plus the topology validation error.
 
 `build_closed_boolean_output` is the generalized closed-output assembler. It consumes the full classified-region report, triangulates every kept region from both operands in its source face domain, passes the resulting mesh through the same healing stage, and returns a validated closed `Solid` when the kept regions form a watertight shell. This covers closed unsplit outputs and multi-region outputs that already close; it still stops short of rewriting analytic trim loops and persistent shell topology in-place.
+
+## Exchange
+
+`src/exchange.rs` provides deterministic file exchange for the current faceted topology representation. STEP import/export uses a small Part 21 faceted B-rep subset: `CARTESIAN_POINT` records are referenced by `POLY_LOOP`s, which feed `FACE_OUTER_BOUND`, `FACE`, `CLOSED_SHELL`, and `FACETED_BREP` records. Import reconstructs indexed triangles from those loops and validates the result through `Solid::from_triangle_mesh`.
+
+IGES import/export is a compact faceted subset intended for regression interchange: type-like `116` records store shared points and `106` records store triangle connectivity. This preserves mesh hashes and topology counts across round-trips for the current kernel solids. It deliberately does not parse arbitrary IGES directory sections, analytic surfaces, trims, assemblies, layers, or units yet.
 
 ## GPU And Browser
 

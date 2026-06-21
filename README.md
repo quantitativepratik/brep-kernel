@@ -33,6 +33,8 @@ Then open `http://localhost:8080/web/`.
 - Persistent topology identity and history: every solid carries stable IDs for vertices, half-edges, edges, staged split edges, faces, and shells, plus revisioned mutation events with created/modified/parent ancestry.
 - Transactional topology mutation: explicit `TopologyTransaction` guards group topology edits, commit validated changes, or restore the original solid with rollback entries for every undone mutation.
 - Per-entity tolerance model: aligned tolerance records for vertices, directed coedges, edges, and faces, integrated into validation and trim/edge checks.
+- Structured diagnostics: `KernelError` carries subsystem, severity, category, stable code, operation, entity reference, source error, and related notes.
+- STEP/IGES exchange: deterministic import/export for a documented faceted B-rep subset, with validated round-trips through the half-edge constructor.
 - Edge and face geometry: `EdgeCurve3D` model-space curves on topological edges, `FaceSurface` support surfaces, outer/inner `TrimLoop`s with per-face 2D p-curves, trim-loop orientation/nesting analysis, seeded NURBS-surface p-curve generation, periodic seam unwrapping, and singular-boundary handling.
 - Tolerance-aware sewing: clusters near-coincident mesh vertices, removes triangles collapsed by sewing, reports the vertex remap, and validates the sewn mesh as half-edge topology.
 - Euler construction operators: `MVFS`, `MEV`, and `MEF`, with count invariants and conversion into validated half-edge solids.
@@ -151,17 +153,22 @@ The intersection module has exact analytic line/plane and plane/plane routines, 
 
 The predicates are conservative interval filters. When a determinant cannot be certified, the API returns `Uncertain`; it does not silently trust an unstable sign.
 
+The exchange module is intentionally scoped to faceted solids. STEP uses a small Part 21 `FACETED_BREP` subset built from `CARTESIAN_POINT`, `POLY_LOOP`, `FACE_OUTER_BOUND`, `FACE`, and `CLOSED_SHELL`. IGES uses a compact faceted subset with point and triangle records for deterministic regression interchange. This is real import/export infrastructure for the current kernel representation, not a full AP242/IGES translator for analytic NURBS trims, assemblies, colors, layers, or product metadata.
+
 ## Roadmap
 
 - Broaden Euler operators beyond the current `MVFS`, `MEV`, and `MEF` construction layer.
 - Promote broader staged face-split graphs into healed trim loops and rewritten shell topology using the transaction and persistent-ID layers.
 - Extend NURBS/NURBS SSI with coplanar overlap classification and higher-order curve fitting.
 - Generalize healed Boolean output from classified region graphs into rewritten trim loops, stitched shell topology, and coincident overlap cases.
+- Extend STEP/IGES exchange from faceted round-trips to analytic surfaces, trims, units, names, and assemblies.
 - Add viewer overlays for topology, normals, residuals, and golden-reference inspection.
 
 ## Repository Map
 
 - `src/topology.rs` - half-edge B-rep data structure and validation
+- `src/errors.rs` - structured kernel diagnostics and error conversion
+- `src/exchange.rs` - STEP/IGES faceted import/export
 - `src/euler.rs` - Euler construction operators
 - `src/nurbs.rs` - NURBS curves/surfaces, derivatives, knot insertion
 - `src/predicates.rs` - interval-filtered robust predicates

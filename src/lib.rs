@@ -9,7 +9,9 @@
 //! raw WASM exports for the browser viewer.
 
 pub mod boolean;
+pub mod errors;
 pub mod euler;
+pub mod exchange;
 pub mod features;
 pub mod geometry;
 pub mod intersection;
