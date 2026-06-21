@@ -69,6 +69,8 @@ Before classification, `build_face_intersection_graph` now provides the all-pair
 
 `heal_classified_split_faces` promotes the supported subset of those decisions into output geometry. For a boundary-to-boundary split on a polyline-trimmable face, it walks the outer trim boundary, builds the kept trim loop for the requested side, evaluates the loop back onto the analytic face, triangulates the healed region, and sends the mesh through `heal_boolean_triangle_mesh`. That repair stage clusters gap vertices, removes triangles collapsed by sewing, filters tiny-edge/sliver/duplicate triangles, compacts the mesh, and tries to validate the result as a new half-edge `Solid`. If arbitrary input still cannot be made manifold, the caller receives the repaired mesh plus the topology validation error.
 
+`build_closed_boolean_output` is the generalized closed-output assembler. It consumes the full classified-region report, triangulates every kept region from both operands in its source face domain, passes the resulting mesh through the same healing stage, and returns a validated closed `Solid` when the kept regions form a watertight shell. This covers closed unsplit outputs and multi-region outputs that already close; it still stops short of rewriting analytic trim loops and persistent shell topology in-place.
+
 ## GPU And Browser
 
 `assets/shaders/nurbs_tessellate.wgsl` evaluates a rational cubic patch in a compute shader. `web/app.js` dispatches the compute pass, renders the resulting vertex buffer, and can load the Rust-generated WASM boolean mesh.

@@ -1,7 +1,7 @@
 use brep_kernel::boolean::{
-    classify_boolean_regions, classify_split_faces, heal_classified_split_faces, BooleanError,
-    BooleanOp, BooleanOperand, BooleanRegionAction, BooleanRegionSide, BooleanSplitStatus,
-    HealedRegionSide, TrimDomainStatus,
+    build_closed_boolean_output, classify_boolean_regions, classify_split_faces,
+    heal_classified_split_faces, BooleanError, BooleanOp, BooleanOperand, BooleanRegionAction,
+    BooleanRegionSide, BooleanSplitStatus, HealedRegionSide, TrimDomainStatus,
 };
 use brep_kernel::geometry::Plane;
 use brep_kernel::math::{Point3, Vec2, Vec3};
@@ -158,6 +158,43 @@ fn region_classification_includes_unsplit_faces_against_closed_other_operand() {
             .count(),
         12
     );
+}
+
+#[test]
+fn generalized_closed_output_builds_valid_solid_from_kept_regions() {
+    let (solid, operands) = nested_box_operands();
+    let regions =
+        classify_boolean_regions(&solid, &operands, BooleanOp::Intersect, 1.0e-8).unwrap();
+
+    let output = build_closed_boolean_output(&solid, &regions, 1.0e-8).unwrap();
+
+    assert_eq!(output.operation, BooleanOp::Intersect);
+    assert_eq!(output.input_region_count, 24);
+    assert_eq!(output.kept_region_count, 12);
+    assert_eq!(output.discarded_region_count, 12);
+    assert_eq!(output.ambiguous_region_count, 0);
+    assert!(output.healing_report.manifold);
+    assert!(output.solid_error.is_none());
+    assert_eq!(output.mesh.triangles.len(), 12);
+    let output_solid = output.solid.expect("kept inner-box regions close");
+    output_solid.validate().unwrap();
+    assert_eq!(output_solid.euler_characteristic(), 2);
+    assert!((output_solid.volume() - 1.0).abs() <= 1.0e-8);
+    assert!((output_solid.surface_area() - 6.0).abs() <= 1.0e-8);
+}
+
+#[test]
+fn generalized_closed_output_reports_partial_region_sets() {
+    let solid = planar_boundary_split_fixture();
+    let operands = operands_for_fixture(&solid);
+    let regions = classify_boolean_regions(&solid, &operands, BooleanOp::Union, 1.0e-9).unwrap();
+
+    let output = build_closed_boolean_output(&solid, &regions, 1.0e-9).unwrap();
+
+    assert!(output.solid.is_none());
+    assert!(output.solid_error.is_some());
+    assert!(!output.healing_report.manifold);
+    assert!(output.kept_region_count > 0);
 }
 
 fn planar_split_fixture(outside_first_face: bool) -> Solid {

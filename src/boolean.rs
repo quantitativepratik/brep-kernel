@@ -276,6 +276,31 @@ pub struct BooleanMeshHealingOutput {
     pub report: BooleanMeshHealingReport,
 }
 
+/// Generalized Boolean output assembled from classified kept regions.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ClosedBooleanOutput {
+    /// Boolean operation used for region classification.
+    pub operation: BooleanOp,
+    /// Kept classified regions used to assemble the output mesh.
+    pub kept_regions: Vec<BooleanClassifiedRegion>,
+    /// Healed and compacted output mesh.
+    pub mesh: HealedTriangleMesh,
+    /// Valid closed half-edge solid when the kept regions form a watertight shell.
+    pub solid: Option<Solid>,
+    /// Topology validation error when the kept regions produce only a partial or invalid shell.
+    pub solid_error: Option<TopologyError>,
+    /// Number of input classified regions considered.
+    pub input_region_count: usize,
+    /// Number of kept regions emitted into the output mesh.
+    pub kept_region_count: usize,
+    /// Number of classified regions discarded before meshing.
+    pub discarded_region_count: usize,
+    /// Number of ambiguous regions ignored before meshing.
+    pub ambiguous_region_count: usize,
+    /// Mesh repair diagnostics from the final healing pass.
+    pub healing_report: BooleanMeshHealingReport,
+}
+
 /// Output from promoting classified split faces into healed regions.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HealedBooleanOutput {
@@ -850,6 +875,63 @@ pub fn heal_boolean_triangle_mesh(
         },
         mesh,
         solid,
+    })
+}
+
+/// Assemble classified Boolean regions into a healed closed output solid when possible.
+///
+/// This is the generalized output stage for the current pipeline. It consumes
+/// the region graph from [`classify_boolean_regions`], triangulates every kept
+/// region on its source face, runs the Boolean mesh-healing pass, and returns a
+/// validated closed [`Solid`] when the kept regions form a watertight manifold.
+/// If the regions are still partial, the repaired mesh and topology error are
+/// returned for diagnostics.
+pub fn build_closed_boolean_output(
+    solid: &Solid,
+    classification: &BooleanRegionClassificationReport,
+    tolerance: f64,
+) -> Result<ClosedBooleanOutput, BooleanError> {
+    if !tolerance.is_finite() || tolerance < 0.0 {
+        return Err(BooleanError::InvalidInput("tolerance must be nonnegative"));
+    }
+    if classification.face_count != solid.faces.len() {
+        return Err(BooleanError::InvalidInput(
+            "classification must match the source solid face count",
+        ));
+    }
+    solid.validate()?;
+    let tolerance = tolerance.max(1.0e-9);
+    let kept_regions: Vec<BooleanClassifiedRegion> = classification
+        .regions
+        .iter()
+        .filter(|region| action_keeps_region(region.action))
+        .cloned()
+        .collect();
+    let discarded_region_count = classification
+        .regions
+        .iter()
+        .filter(|region| region.action == BooleanRegionAction::Discard)
+        .count();
+    let ambiguous_region_count = classification
+        .regions
+        .iter()
+        .filter(|region| region.action == BooleanRegionAction::Ambiguous)
+        .count();
+
+    let raw_mesh = triangulate_classified_regions(solid, &kept_regions, tolerance)?;
+    let healed = heal_boolean_triangle_mesh(raw_mesh.vertices, &raw_mesh.triangles, tolerance)?;
+    let solid_error = healed.report.solid_error.clone();
+    Ok(ClosedBooleanOutput {
+        operation: classification.operation,
+        input_region_count: classification.regions.len(),
+        kept_region_count: kept_regions.len(),
+        discarded_region_count,
+        ambiguous_region_count,
+        kept_regions,
+        mesh: healed.mesh,
+        solid: healed.solid,
+        solid_error,
+        healing_report: healed.report,
     })
 }
 
@@ -2191,6 +2273,61 @@ fn triangulate_healed_regions(
             -region.normal
         } else {
             region.normal
+        };
+        for chunk in local_triangles.chunks_exact(3) {
+            push_oriented_triangle(
+                &mesh.vertices,
+                &mut mesh.triangles,
+                [indices[chunk[0]], indices[chunk[1]], indices[chunk[2]]],
+                desired,
+            );
+        }
+    }
+    Ok(mesh)
+}
+
+fn triangulate_classified_regions(
+    solid: &Solid,
+    regions: &[BooleanClassifiedRegion],
+    tolerance: f64,
+) -> Result<HealedTriangleMesh, BooleanError> {
+    let mut mesh = HealedTriangleMesh::default();
+    for region in regions {
+        if region.uv_loop.len() < 3 {
+            return Err(BooleanError::Unsupported);
+        }
+        let face = solid
+            .faces
+            .get(region.face)
+            .ok_or(BooleanError::Unsupported)?;
+        let mut flat = Vec::with_capacity(region.uv_loop.len() * 2);
+        let mut vertices = Vec::with_capacity(region.uv_loop.len());
+        for uv in &region.uv_loop {
+            flat.push(uv.x);
+            flat.push(uv.y);
+            vertices.push(
+                face.surface
+                    .evaluate(*uv)
+                    .ok_or(BooleanError::Unsupported)?,
+            );
+        }
+        let local_triangles =
+            earcutr::earcut(&flat, &[], 2).map_err(|_| BooleanError::Unsupported)?;
+        if local_triangles.len() % 3 != 0 {
+            return Err(BooleanError::Unsupported);
+        }
+        let indices: Vec<usize> = vertices
+            .iter()
+            .map(|vertex| weld_mesh_vertex(&mut mesh.vertices, *vertex, tolerance))
+            .collect();
+        let normal = face
+            .surface
+            .normal_at(region.uv_loop[0])
+            .ok_or(BooleanError::Unsupported)?;
+        let desired = if region.orientation_reversed {
+            -normal
+        } else {
+            normal
         };
         for chunk in local_triangles.chunks_exact(3) {
             push_oriented_triangle(
