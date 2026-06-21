@@ -139,6 +139,168 @@ impl KernelDiagnostic {
             notes: Vec::new(),
         }
     }
+
+    /// Attach an operation name.
+    pub fn with_operation(mut self, operation: impl Into<String>) -> Self {
+        self.operation = Some(operation.into());
+        self
+    }
+
+    /// Attach an entity reference.
+    pub fn with_entity(mut self, entity: KernelEntityRef) -> Self {
+        self.entity = Some(entity);
+        self
+    }
+
+    /// Attach a lower-level source error string.
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = Some(source.into());
+        self
+    }
+
+    /// Attach an additional note.
+    pub fn with_note(mut self, note: impl Into<String>) -> Self {
+        self.notes.push(note.into());
+        self
+    }
+}
+
+/// Accumulates structured diagnostics for operations that can continue after warnings.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct KernelDiagnosticReport {
+    diagnostics: Vec<KernelDiagnostic>,
+}
+
+impl KernelDiagnosticReport {
+    /// Create an empty diagnostic report.
+    pub fn new() -> Self {
+        Self {
+            diagnostics: Vec::new(),
+        }
+    }
+
+    /// Add a diagnostic and return the report for chaining.
+    pub fn with_diagnostic(mut self, diagnostic: KernelDiagnostic) -> Self {
+        self.push(diagnostic);
+        self
+    }
+
+    /// Add a diagnostic.
+    pub fn push(&mut self, diagnostic: KernelDiagnostic) {
+        self.diagnostics.push(diagnostic);
+    }
+
+    /// Add an informational diagnostic.
+    pub fn info(
+        &mut self,
+        subsystem: KernelSubsystem,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.push(KernelDiagnostic::new(
+            DiagnosticSeverity::Info,
+            subsystem,
+            KernelErrorKind::Validation,
+            code,
+            message,
+        ));
+    }
+
+    /// Add a warning diagnostic.
+    pub fn warning(
+        &mut self,
+        subsystem: KernelSubsystem,
+        kind: KernelErrorKind,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.push(KernelDiagnostic::new(
+            DiagnosticSeverity::Warning,
+            subsystem,
+            kind,
+            code,
+            message,
+        ));
+    }
+
+    /// Add an error diagnostic.
+    pub fn error(
+        &mut self,
+        subsystem: KernelSubsystem,
+        kind: KernelErrorKind,
+        code: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.push(KernelDiagnostic::new(
+            DiagnosticSeverity::Error,
+            subsystem,
+            kind,
+            code,
+            message,
+        ));
+    }
+
+    /// Read all diagnostics.
+    pub fn diagnostics(&self) -> &[KernelDiagnostic] {
+        &self.diagnostics
+    }
+
+    /// Consume the report into diagnostics.
+    pub fn into_diagnostics(self) -> Vec<KernelDiagnostic> {
+        self.diagnostics
+    }
+
+    /// True when no diagnostics have been recorded.
+    pub fn is_empty(&self) -> bool {
+        self.diagnostics.is_empty()
+    }
+
+    /// Number of diagnostics with error or fatal severity.
+    pub fn error_count(&self) -> usize {
+        self.diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                matches!(
+                    diagnostic.severity,
+                    DiagnosticSeverity::Error | DiagnosticSeverity::Fatal
+                )
+            })
+            .count()
+    }
+
+    /// Number of diagnostics with warning severity.
+    pub fn warning_count(&self) -> usize {
+        self.diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Warning)
+            .count()
+    }
+
+    /// True when at least one diagnostic is an error or fatal error.
+    pub fn has_errors(&self) -> bool {
+        self.error_count() > 0
+    }
+
+    /// Return the supplied value if the report has no errors.
+    ///
+    /// If errors are present, the first error becomes the primary diagnostic and
+    /// all other diagnostics are attached as related context.
+    pub fn into_result<T>(self, value: T) -> KernelResult<T> {
+        let mut diagnostics = self.diagnostics;
+        let Some(primary_index) = diagnostics.iter().position(|diagnostic| {
+            matches!(
+                diagnostic.severity,
+                DiagnosticSeverity::Error | DiagnosticSeverity::Fatal
+            )
+        }) else {
+            return Ok(value);
+        };
+        let primary = diagnostics.remove(primary_index);
+        Err(KernelError {
+            primary: Box::new(primary),
+            related: diagnostics,
+        })
+    }
 }
 
 /// Structured kernel error with a primary diagnostic and related diagnostics.
@@ -245,13 +407,31 @@ impl From<TopologyError> for KernelError {
 
 impl From<BooleanError> for KernelError {
     fn from(value: BooleanError) -> Self {
-        Self::new(
-            KernelSubsystem::Boolean,
-            KernelErrorKind::Validation,
-            "boolean.error",
-            "boolean operation failed",
-        )
-        .with_source(format!("{value:?}"))
+        match value {
+            BooleanError::Unsupported => Self::new(
+                KernelSubsystem::Boolean,
+                KernelErrorKind::Unsupported,
+                "boolean.unsupported",
+                "boolean operation is outside the currently implemented kernel scope",
+            )
+            .with_source("Unsupported")
+            .with_note("the boolean subsystem returns structured diagnostics for unsupported topology or geometry cases instead of panicking")
+            .with_note("supported closed output currently depends on classified kept regions that can be triangulated and sewn into a watertight shell"),
+            BooleanError::InvalidInput(message) => Self::new(
+                KernelSubsystem::Boolean,
+                KernelErrorKind::InvalidInput,
+                "boolean.invalid_input",
+                message,
+            )
+            .with_source(format!("InvalidInput({message:?})")),
+            BooleanError::Topology(error) => Self::new(
+                KernelSubsystem::Boolean,
+                KernelErrorKind::Topology,
+                "boolean.topology",
+                "boolean operation produced invalid topology",
+            )
+            .with_source(format!("{error:?}")),
+        }
     }
 }
 

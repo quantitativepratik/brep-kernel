@@ -14,6 +14,8 @@ The supported scope is intentionally explicit: each implemented operation has te
 
 ```sh
 cargo test
+cargo run --example exchange_roundtrip
+cargo bench --bench kernel_bench
 cargo run --features native-viewer --bin native-viewer
 ```
 
@@ -34,6 +36,7 @@ Then open `http://localhost:8080/web/`.
 - Transactional topology mutation: explicit `TopologyTransaction` guards group topology edits, commit validated changes, or restore the original solid with rollback entries for every undone mutation.
 - Per-entity tolerance model: aligned tolerance records for vertices, directed coedges, edges, and faces, integrated into validation and trim/edge checks.
 - Structured diagnostics: `KernelError` carries subsystem, severity, category, stable code, operation, entity reference, source error, and related notes.
+- Diagnostic reports: `KernelDiagnosticReport` accumulates warnings/errors for multi-stage operations and promotes the first error into a structured `KernelError` with related context.
 - STEP/IGES exchange: deterministic import/export for a documented faceted B-rep subset, with validated round-trips through the half-edge constructor.
 - Edge and face geometry: `EdgeCurve3D` model-space curves on topological edges, `FaceSurface` support surfaces, outer/inner `TrimLoop`s with per-face 2D p-curves, trim-loop orientation/nesting analysis, seeded NURBS-surface p-curve generation, periodic seam unwrapping, and singular-boundary handling.
 - Tolerance-aware sewing: clusters near-coincident mesh vertices, removes triangles collapsed by sewing, reports the vertex remap, and validates the sewn mesh as half-edge topology.
@@ -87,6 +90,7 @@ Then open `http://localhost:8080/web/`.
 - Regression corpus under `corpus/regression`.
 - Versioned reference models under `corpus/reference/v1` with golden mesh hashes, topology counts, volume, and surface-area invariants.
 - Property-based tests using `proptest` to generate valid solids and assert closed-manifold invariants.
+- Compile-checked examples, tutorials, a stable benchmark harness, profiling notes, and a cross-platform CI matrix.
 
 ## Run The Core Tests
 
@@ -101,6 +105,17 @@ To print updated reference outputs after an intentional mesh change:
 ```sh
 cargo test --test reference_models dump_reference_golden_outputs -- --ignored --nocapture
 ```
+
+## Run Examples And Benchmarks
+
+```sh
+cargo run --example boolean_diagnostics
+cargo run --example exchange_roundtrip
+cargo run --example transactional_topology
+cargo bench --bench kernel_bench
+```
+
+See [docs/Tutorials.md](docs/Tutorials.md) and [docs/Profiling.md](docs/Profiling.md).
 
 ## Run The Browser Viewer
 
@@ -135,15 +150,19 @@ It opens a `wgpu` window and renders a CPU-tessellated rational NURBS patch with
 
 ## Quality Gates
 
-The GitHub Actions workflow runs:
+The GitHub Actions workflow runs a matrix over Ubuntu stable, macOS stable, and the declared MSRV (`1.87`). The full Ubuntu stable gate runs:
 
 ```sh
 cargo fmt -- --check
 cargo test --locked
+cargo check --examples --locked
+cargo check --benches --locked
 cargo clippy --all-targets --locked -- -D warnings
 cargo build --target wasm32-unknown-unknown --release --locked
 cargo check --features native-viewer --bin native-viewer --locked
 ```
+
+The macOS lane runs tests, examples, benchmarks, and the native viewer check. The MSRV lane runs tests plus examples/benchmarks without the heavier optional viewer/WASM gates.
 
 ## Design Boundaries
 
@@ -178,11 +197,15 @@ The exchange module is intentionally scoped to faceted solids. STEP uses a small
 - `src/tessellation.rs` - CPU tessellation
 - `src/wasm.rs` - raw WASM exports
 - `src/bin/native_viewer.rs` - native `wgpu`/`winit` viewer binary
+- `examples/` - runnable diagnostics, exchange, and transaction examples
+- `benches/kernel_bench.rs` - stable benchmark/profiling harness
 - `assets/shaders/nurbs_tessellate.wgsl` - WebGPU compute tessellator
 - `web/` - browser viewer
 - `tests/` - executable regression tests
 - `docs/EulerOperators.md` - Euler operator scope and invariants
 - `docs/FeatureLayer.md` - prompt-to-feature-tree design and dependency choices
+- `docs/Tutorials.md` - executable project walkthroughs
+- `docs/Profiling.md` - benchmark and profiling workflow
 - `corpus/regression/` - text corpus for bug and degeneracy cases
 - `corpus/reference/v1/` - versioned reference models and golden outputs
 

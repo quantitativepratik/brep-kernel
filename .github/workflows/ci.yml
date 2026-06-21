@@ -14,31 +14,61 @@ env:
 
 jobs:
   rust:
-    name: Rust
-    runs-on: ubuntu-latest
+    name: Rust (${{ matrix.os }}, ${{ matrix.toolchain }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            toolchain: stable
+            full_lint: true
+            wasm: true
+            native_viewer: true
+          - os: macos-latest
+            toolchain: stable
+            full_lint: false
+            wasm: false
+            native_viewer: true
+          - os: ubuntu-latest
+            toolchain: "1.87"
+            full_lint: false
+            wasm: false
+            native_viewer: false
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ matrix.toolchain }}
           targets: wasm32-unknown-unknown
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
 
       - name: Format
+        if: matrix.full_lint
         run: cargo fmt -- --check
 
       - name: Test
         run: cargo test --locked
 
+      - name: Examples check
+        run: cargo check --examples --locked
+
+      - name: Benchmarks check
+        run: cargo check --benches --locked
+
       - name: Clippy
+        if: matrix.full_lint
         run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: WASM release build
+        if: matrix.wasm
         run: cargo build --target wasm32-unknown-unknown --release --locked
 
       - name: Native viewer check
+        if: matrix.native_viewer
         run: cargo check --features native-viewer --bin native-viewer --locked

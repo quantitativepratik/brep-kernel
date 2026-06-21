@@ -39,5 +39,9 @@ name = "native-viewer"
 path = "src/bin/native_viewer.rs"
 required-features = ["native-viewer"]
 
+[[bench]]
+name = "kernel_bench"
+harness = false
+
 [dev-dependencies]
 proptest = "1"
