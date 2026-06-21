@@ -7,7 +7,12 @@
 //! NURBS curves/surfaces, interval-filtered predicates, representative
 //! intersection routines, a cube-minus-cylinder boolean, CPU tessellation, and
 //! raw WASM exports for the browser viewer.
+//!
+//! Prefer [`api`] or [`prelude`] for application code. The direct subsystem
+//! modules are public for experimentation and focused kernel work, but the API
+//! facade is the compatibility boundary documented by the versioning policy.
 
+pub mod api;
 pub mod boolean;
 pub mod errors;
 pub mod euler;
@@ -21,5 +26,10 @@ pub mod predicates;
 pub mod tessellation;
 pub mod topology;
 pub mod wasm;
+
+/// Common imports from the stable public API facade.
+pub mod prelude {
+    pub use crate::api::prelude::*;
+}
 
 pub use math::{Point3, Vec2, Vec3};

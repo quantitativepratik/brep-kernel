@@ -17,7 +17,7 @@ static BUFFER: OnceLock<Mutex<Vec<f32>>> = OnceLock::new();
 /// ABI version for the browser.
 #[no_mangle]
 pub extern "C" fn brep_version() -> u32 {
-    1
+    crate::api::WASM_ABI_REVISION
 }
 
 /// Generate the cube-minus-cylinder demo mesh.

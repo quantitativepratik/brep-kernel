@@ -17,6 +17,7 @@ Run the main quality gates:
 cargo fmt -- --check
 cargo test
 cargo clippy --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 cargo build --target wasm32-unknown-unknown --release
 cargo check --features native-viewer --bin native-viewer
 ```
@@ -28,6 +29,20 @@ cargo check --features native-viewer --bin native-viewer
 - Prefer small, focused changes over broad rewrites.
 - Do not remove golden-file assertions unless the reference model change is intentional and documented.
 - Update `README.md` and `docs/` when behavior or supported scope changes.
+
+## Public API Discipline
+
+Prefer adding application-facing API through `brep_kernel::api` and `brep_kernel::prelude`.
+Direct subsystem modules are public for kernel engineering, but the facade is the
+compatibility boundary described in `docs/PublicApi.md`.
+
+When changing the facade:
+
+- Add or update tests in `tests/public_api.rs`.
+- Update `CHANGELOG.md`.
+- Increment `API_REVISION` when the curated facade changes materially.
+- Increment `WASM_ABI_REVISION` when raw browser ABI signatures, buffer layout, or units change.
+- Do not increase the MSRV without a minor-version rationale and changelog note.
 
 ## Reference Outputs
 

@@ -2,6 +2,18 @@
 
 The kernel is arranged around a small set of boundaries.
 
+## Public API Boundary
+
+`src/api.rs` is the curated application-facing facade. It re-exports the stable
+surface callers should prefer through `brep_kernel::api` and
+`brep_kernel::prelude`, and exposes crate/API/WASM/MSRV version metadata for
+runtime diagnostics.
+
+The implementation modules remain public because kernel work often needs direct
+access to topology, intersections, and Boolean machinery. Those modules are
+documented and tested, but promotion into `src/api.rs` is the signal that an item
+has entered the compatibility surface described in `docs/PublicApi.md`.
+
 ## Topology
 
 `src/topology.rs` owns the half-edge structure:

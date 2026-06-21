@@ -35,6 +35,7 @@ Then open `http://localhost:8080/web/`.
 - Persistent topology identity and history: every solid carries stable IDs for vertices, half-edges, edges, staged split edges, faces, and shells, plus revisioned mutation events with created/modified/parent ancestry.
 - Transactional topology mutation: explicit `TopologyTransaction` guards group topology edits, commit validated changes, or restore the original solid with rollback entries for every undone mutation.
 - Per-entity tolerance model: aligned tolerance records for vertices, directed coedges, edges, and faces, integrated into validation and trim/edge checks.
+- Stable public API facade: `brep_kernel::api` and `brep_kernel::prelude` expose the application-facing compatibility surface with version and ABI metadata.
 - Structured diagnostics: `KernelError` carries subsystem, severity, category, stable code, operation, entity reference, source error, and related notes.
 - Diagnostic reports: `KernelDiagnosticReport` accumulates warnings/errors for multi-stage operations and promotes the first error into a structured `KernelError` with related context.
 - STEP/IGES exchange: deterministic import/export for a documented faceted B-rep subset, with validated round-trips through the half-edge constructor.
@@ -117,6 +118,16 @@ cargo bench --bench kernel_bench
 
 See [docs/Tutorials.md](docs/Tutorials.md) and [docs/Profiling.md](docs/Profiling.md).
 
+## Public API
+
+Application code should prefer:
+
+```rust
+use brep_kernel::prelude::*;
+```
+
+The curated facade lives under `brep_kernel::api` and exposes version metadata through `api::version()`, `API_REVISION`, `WASM_ABI_REVISION`, and `MINIMUM_SUPPORTED_RUST_VERSION`. Direct subsystem modules remain public for kernel engineering and experimentation, but the facade is the compatibility boundary. See [docs/PublicApi.md](docs/PublicApi.md).
+
 ## Run The Browser Viewer
 
 The viewer is static, but it should be served over HTTP so it can fetch the WGSL shader and optional WASM artifact.
@@ -158,6 +169,7 @@ cargo test --locked
 cargo check --examples --locked
 cargo check --benches --locked
 cargo clippy --all-targets --locked -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --locked
 cargo build --target wasm32-unknown-unknown --release --locked
 cargo check --features native-viewer --bin native-viewer --locked
 ```
@@ -186,6 +198,7 @@ The exchange module is intentionally scoped to faceted solids. STEP uses a small
 ## Repository Map
 
 - `src/topology.rs` - half-edge B-rep data structure and validation
+- `src/api.rs` - stable public API facade and version metadata
 - `src/errors.rs` - structured kernel diagnostics and error conversion
 - `src/exchange.rs` - STEP/IGES faceted import/export
 - `src/euler.rs` - Euler construction operators
@@ -204,6 +217,7 @@ The exchange module is intentionally scoped to faceted solids. STEP uses a small
 - `tests/` - executable regression tests
 - `docs/EulerOperators.md` - Euler operator scope and invariants
 - `docs/FeatureLayer.md` - prompt-to-feature-tree design and dependency choices
+- `docs/PublicApi.md` - API tiers, SemVer/MSRV policy, and release checklist
 - `docs/Tutorials.md` - executable project walkthroughs
 - `docs/Profiling.md` - benchmark and profiling workflow
 - `corpus/regression/` - text corpus for bug and degeneracy cases

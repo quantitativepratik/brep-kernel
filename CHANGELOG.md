@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Added the `brep_kernel::api` facade and top-level `brep_kernel::prelude` as the curated public compatibility surface.
+- Added runtime version metadata: crate version components, `API_REVISION`, `WASM_ABI_REVISION`, and `MINIMUM_SUPPORTED_RUST_VERSION`.
+- Added public API policy documentation, facade regression tests, and rustdoc checks in CI.
+- Routed the raw WASM `brep_version()` export through the shared ABI revision constant.
+
 ## 0.1.0
 
 Initial public prototype:
