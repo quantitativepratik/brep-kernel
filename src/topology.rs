@@ -4,7 +4,7 @@ use crate::geometry::{Circle, Cylinder, Plane};
 use crate::math::{Point3, Vec2, Vec3};
 use crate::nurbs::{NurbsCurve, NurbsSurface};
 use crate::predicates::{orient2d, Interval, RobustSign};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Vertex identifier.
 pub type VertexId = usize;
@@ -16,6 +16,99 @@ pub type EdgeId = usize;
 pub type FaceId = usize;
 /// Split-edge identifier for staged face-splitting wires.
 pub type SplitEdgeId = usize;
+/// Persistent topology revision identifier.
+pub type TopologyRevisionId = u64;
+
+/// Kind tag carried by a persistent topological id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PersistentTopologyKind {
+    /// Vertex identity.
+    Vertex,
+    /// Directed half-edge identity.
+    HalfEdge,
+    /// Undirected edge identity.
+    Edge,
+    /// Staged split-edge identity.
+    SplitEdge,
+    /// Face identity.
+    Face,
+    /// Shell identity.
+    Shell,
+}
+
+/// Stable id for a topological entity across local topology edits.
+///
+/// `VertexId`, `EdgeId`, and `FaceId` are compact snapshot indices. A
+/// `PersistentId` is the longer-lived identity that survives metadata edits,
+/// trim edits, p-curve generation, and staged split creation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PersistentId {
+    /// Entity kind.
+    pub kind: PersistentTopologyKind,
+    /// Monotonic serial number within the owning solid history.
+    pub serial: u64,
+}
+
+impl PersistentId {
+    /// Construct a persistent id from a kind and serial.
+    pub fn new(kind: PersistentTopologyKind, serial: u64) -> Self {
+        Self { kind, serial }
+    }
+}
+
+/// Topology operation recorded in a solid's history.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopologyOperation {
+    /// Solid was constructed from an indexed triangle mesh.
+    ConstructTriangleMesh,
+    /// Solid was constructed after tolerance-aware sewing.
+    SewTriangleMesh,
+    /// A face support surface was replaced.
+    SetFaceSurface,
+    /// Face trim loops were replaced.
+    SetFaceTrimLoops,
+    /// An edge's model-space curve was replaced.
+    SetEdgeCurve,
+    /// A face-side p-curve was replaced.
+    SetTrimCurve,
+    /// Face p-curves were generated from model-space edge curves.
+    GenerateFacePcurves,
+    /// A staged split edge was installed on two faces.
+    SplitFacesWithCurves,
+    /// A trim-ready intersection curve was promoted to face topology.
+    InstallTrimReadyFaceCurve,
+}
+
+/// One persistent-history event for a topology mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopologyHistoryEvent {
+    /// Revision after the event was applied.
+    pub revision: TopologyRevisionId,
+    /// Operation that produced the event.
+    pub operation: TopologyOperation,
+    /// New persistent entities created by the event.
+    pub created: Vec<PersistentId>,
+    /// Existing persistent entities modified by the event.
+    pub modified: Vec<PersistentId>,
+    /// Persistent entities retired by the event.
+    pub deleted: Vec<PersistentId>,
+    /// Source entities used to derive created or modified topology.
+    pub parents: Vec<PersistentId>,
+}
+
+/// Persistent ids and mutation history for one solid snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopologyIdentity {
+    vertices: Vec<PersistentId>,
+    halfedges: Vec<PersistentId>,
+    edges: Vec<PersistentId>,
+    split_edges: Vec<PersistentId>,
+    faces: Vec<PersistentId>,
+    shells: Vec<PersistentId>,
+    next_serial: u64,
+    revision: TopologyRevisionId,
+    history: Vec<TopologyHistoryEvent>,
+}
 
 /// A topological vertex with geometric position.
 #[derive(Clone, Debug, PartialEq)]
@@ -701,6 +794,136 @@ pub struct Solid {
     pub faces: Vec<Face>,
     /// Shells.
     pub shells: Vec<Shell>,
+    /// Persistent ids and mutation history for this topology snapshot.
+    pub identity: TopologyIdentity,
+}
+
+impl TopologyIdentity {
+    /// Construct identity records for a new triangle-mesh solid.
+    pub fn from_counts(
+        vertices: usize,
+        halfedges: usize,
+        edges: usize,
+        split_edges: usize,
+        faces: usize,
+        shells: usize,
+    ) -> Self {
+        let mut identity = Self {
+            vertices: Vec::new(),
+            halfedges: Vec::new(),
+            edges: Vec::new(),
+            split_edges: Vec::new(),
+            faces: Vec::new(),
+            shells: Vec::new(),
+            next_serial: 1,
+            revision: 0,
+            history: Vec::new(),
+        };
+        identity.vertices = identity.allocate_many(PersistentTopologyKind::Vertex, vertices);
+        identity.halfedges = identity.allocate_many(PersistentTopologyKind::HalfEdge, halfedges);
+        identity.edges = identity.allocate_many(PersistentTopologyKind::Edge, edges);
+        identity.split_edges =
+            identity.allocate_many(PersistentTopologyKind::SplitEdge, split_edges);
+        identity.faces = identity.allocate_many(PersistentTopologyKind::Face, faces);
+        identity.shells = identity.allocate_many(PersistentTopologyKind::Shell, shells);
+        let created = identity.all_ids();
+        identity.record(
+            TopologyOperation::ConstructTriangleMesh,
+            created,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        identity
+    }
+
+    /// Current topology revision.
+    pub fn revision(&self) -> TopologyRevisionId {
+        self.revision
+    }
+
+    /// Persistent history events in revision order.
+    pub fn history(&self) -> &[TopologyHistoryEvent] {
+        &self.history
+    }
+
+    /// Persistent vertex id for a snapshot vertex index.
+    pub fn vertex(&self, vertex: VertexId) -> Option<PersistentId> {
+        self.vertices.get(vertex).copied()
+    }
+
+    /// Persistent half-edge id for a snapshot half-edge index.
+    pub fn halfedge(&self, halfedge: HalfEdgeId) -> Option<PersistentId> {
+        self.halfedges.get(halfedge).copied()
+    }
+
+    /// Persistent edge id for a snapshot edge index.
+    pub fn edge(&self, edge: EdgeId) -> Option<PersistentId> {
+        self.edges.get(edge).copied()
+    }
+
+    /// Persistent staged split-edge id for a snapshot split-edge index.
+    pub fn split_edge(&self, split_edge: SplitEdgeId) -> Option<PersistentId> {
+        self.split_edges.get(split_edge).copied()
+    }
+
+    /// Persistent face id for a snapshot face index.
+    pub fn face(&self, face: FaceId) -> Option<PersistentId> {
+        self.faces.get(face).copied()
+    }
+
+    /// Persistent shell id for a snapshot shell index.
+    pub fn shell(&self, shell: usize) -> Option<PersistentId> {
+        self.shells.get(shell).copied()
+    }
+
+    /// Return every live persistent id in deterministic storage order.
+    pub fn all_ids(&self) -> Vec<PersistentId> {
+        self.vertices
+            .iter()
+            .chain(&self.halfedges)
+            .chain(&self.edges)
+            .chain(&self.split_edges)
+            .chain(&self.faces)
+            .chain(&self.shells)
+            .copied()
+            .collect()
+    }
+
+    fn allocate_many(&mut self, kind: PersistentTopologyKind, count: usize) -> Vec<PersistentId> {
+        (0..count).map(|_| self.allocate(kind)).collect()
+    }
+
+    fn allocate(&mut self, kind: PersistentTopologyKind) -> PersistentId {
+        let id = PersistentId::new(kind, self.next_serial);
+        self.next_serial += 1;
+        id
+    }
+
+    fn allocate_split_edge(&mut self) -> PersistentId {
+        let id = self.allocate(PersistentTopologyKind::SplitEdge);
+        self.split_edges.push(id);
+        id
+    }
+
+    fn record(
+        &mut self,
+        operation: TopologyOperation,
+        created: Vec<PersistentId>,
+        modified: Vec<PersistentId>,
+        deleted: Vec<PersistentId>,
+        parents: Vec<PersistentId>,
+    ) {
+        self.revision += 1;
+        self.history.push(TopologyHistoryEvent {
+            revision: self.revision,
+            operation,
+            created,
+            modified,
+            deleted,
+            parents,
+        });
+    }
 }
 
 /// Stable topology counts used by golden reference models and diagnostics.
@@ -872,6 +1095,8 @@ pub enum TopologyError {
     InvalidTrimLoopNesting(FaceId, usize),
     /// A p-curve could not be generated for an edge on a face.
     PcurveProjectionFailed(FaceId, HalfEdgeId),
+    /// Persistent topology ids do not match the current topology arrays.
+    InvalidPersistentIdentity,
 }
 
 impl Solid {
@@ -976,6 +1201,14 @@ impl Solid {
             edge.tolerance = edge_tolerance;
         }
         solid.validate()?;
+        let modified = solid.identity.all_ids();
+        solid.identity.record(
+            TopologyOperation::SewTriangleMesh,
+            Vec::new(),
+            modified,
+            Vec::new(),
+            Vec::new(),
+        );
         Ok((solid, sewn.report))
     }
 
@@ -984,6 +1217,8 @@ impl Solid {
         points: Vec<Point3>,
         triangles: &[[usize; 3]],
     ) -> Result<Self, TopologyError> {
+        let point_count = points.len();
+        let triangle_count = triangles.len();
         let mut vertices: Vec<Vertex> = points
             .into_iter()
             .map(|point| Vertex {
@@ -1082,6 +1317,14 @@ impl Solid {
             shells: vec![Shell {
                 faces: (0..triangles.len()).collect(),
             }],
+            identity: TopologyIdentity::from_counts(
+                point_count,
+                triangle_count * 3,
+                directed.len() / 2,
+                0,
+                triangle_count,
+                1,
+            ),
         };
         solid.classify_planar_faces();
         solid.validate()?;
@@ -1120,6 +1363,7 @@ impl Solid {
 
     /// Validate internal half-edge adjacency.
     pub fn validate(&self) -> Result<(), TopologyError> {
+        self.validate_persistent_identity()?;
         for (id, he) in self.halfedges.iter().enumerate() {
             if self.halfedges[he.next].prev != id || self.halfedges[he.prev].next != id {
                 return Err(TopologyError::BrokenHalfEdge(id));
@@ -1136,6 +1380,125 @@ impl Solid {
         self.validate_trim_topology()?;
         self.validate_face_splits()?;
         Ok(())
+    }
+
+    /// Validate persistent topological ids and history bookkeeping.
+    pub fn validate_persistent_identity(&self) -> Result<(), TopologyError> {
+        if self.identity.vertices.len() != self.vertices.len()
+            || self.identity.halfedges.len() != self.halfedges.len()
+            || self.identity.edges.len() != self.edges.len()
+            || self.identity.split_edges.len() != self.split_edges.len()
+            || self.identity.faces.len() != self.faces.len()
+            || self.identity.shells.len() != self.shells.len()
+        {
+            return Err(TopologyError::InvalidPersistentIdentity);
+        }
+
+        let mut seen = HashSet::<PersistentId>::new();
+        validate_persistent_id_slice(
+            &self.identity.vertices,
+            PersistentTopologyKind::Vertex,
+            self.identity.next_serial,
+            &mut seen,
+        )?;
+        validate_persistent_id_slice(
+            &self.identity.halfedges,
+            PersistentTopologyKind::HalfEdge,
+            self.identity.next_serial,
+            &mut seen,
+        )?;
+        validate_persistent_id_slice(
+            &self.identity.edges,
+            PersistentTopologyKind::Edge,
+            self.identity.next_serial,
+            &mut seen,
+        )?;
+        validate_persistent_id_slice(
+            &self.identity.split_edges,
+            PersistentTopologyKind::SplitEdge,
+            self.identity.next_serial,
+            &mut seen,
+        )?;
+        validate_persistent_id_slice(
+            &self.identity.faces,
+            PersistentTopologyKind::Face,
+            self.identity.next_serial,
+            &mut seen,
+        )?;
+        validate_persistent_id_slice(
+            &self.identity.shells,
+            PersistentTopologyKind::Shell,
+            self.identity.next_serial,
+            &mut seen,
+        )?;
+
+        let mut expected_revision = 1;
+        for event in &self.identity.history {
+            if event.revision != expected_revision {
+                return Err(TopologyError::InvalidPersistentIdentity);
+            }
+            for id in event
+                .created
+                .iter()
+                .chain(&event.modified)
+                .chain(&event.deleted)
+                .chain(&event.parents)
+            {
+                if id.serial == 0 || id.serial >= self.identity.next_serial {
+                    return Err(TopologyError::InvalidPersistentIdentity);
+                }
+            }
+            expected_revision += 1;
+        }
+        if self.identity.revision + 1 != expected_revision {
+            return Err(TopologyError::InvalidPersistentIdentity);
+        }
+        Ok(())
+    }
+
+    /// Borrow the persistent identity table for this solid.
+    pub fn topology_identity(&self) -> &TopologyIdentity {
+        &self.identity
+    }
+
+    /// Current persistent topology revision.
+    pub fn topology_revision(&self) -> TopologyRevisionId {
+        self.identity.revision()
+    }
+
+    /// Persistent topology history events in revision order.
+    pub fn topology_history(&self) -> &[TopologyHistoryEvent] {
+        self.identity.history()
+    }
+
+    /// Persistent vertex id for a snapshot vertex index.
+    pub fn persistent_vertex_id(&self, vertex: VertexId) -> Option<PersistentId> {
+        self.identity.vertex(vertex)
+    }
+
+    /// Persistent half-edge id for a snapshot half-edge index.
+    pub fn persistent_halfedge_id(&self, halfedge: HalfEdgeId) -> Option<PersistentId> {
+        self.identity.halfedge(halfedge)
+    }
+
+    /// Persistent edge id for a snapshot edge index.
+    pub fn persistent_edge_id(&self, edge: EdgeId) -> Option<PersistentId> {
+        self.identity.edge(edge)
+    }
+
+    /// Persistent staged split-edge id for a snapshot split-edge index.
+    pub fn persistent_split_edge_id(&self, split_edge: SplitEdgeId) -> Option<PersistentId> {
+        self.identity.split_edge(split_edge)
+    }
+
+    /// Persistent face id for a snapshot face index.
+    pub fn persistent_face_id(&self, face: FaceId) -> Option<PersistentId> {
+        self.identity.face(face)
+    }
+
+    /// Persistent shell id for a snapshot shell index.
+    pub fn persistent_shell_id(&self, shell: usize) -> Option<PersistentId> {
+        self.identity.shell(shell)
     }
 
     /// Validate model-space curves attached to topological edges.
@@ -1250,9 +1613,24 @@ impl Solid {
         if face >= self.faces.len() {
             return Err(TopologyError::InvalidFace(face));
         }
+        let modified = vec![self
+            .persistent_face_id(face)
+            .ok_or(TopologyError::InvalidPersistentIdentity)?];
+        let old_face = self.faces[face].clone();
         self.faces[face].surface = surface;
         self.rebuild_face_trim_curves(face);
-        self.validate_trim_topology()
+        if let Err(error) = self.validate_trim_topology() {
+            self.faces[face] = old_face;
+            return Err(error);
+        }
+        self.identity.record(
+            TopologyOperation::SetFaceSurface,
+            Vec::new(),
+            modified.clone(),
+            Vec::new(),
+            modified,
+        );
+        Ok(())
     }
 
     /// Replace a face's trim loops.
@@ -1264,11 +1642,21 @@ impl Solid {
         if face >= self.faces.len() {
             return Err(TopologyError::InvalidFace(face));
         }
+        let modified = vec![self
+            .persistent_face_id(face)
+            .ok_or(TopologyError::InvalidPersistentIdentity)?];
         let old = core::mem::replace(&mut self.faces[face].trim_loops, trim_loops);
         if let Err(error) = self.validate_trim_topology() {
             self.faces[face].trim_loops = old;
             return Err(error);
         }
+        self.identity.record(
+            TopologyOperation::SetFaceTrimLoops,
+            Vec::new(),
+            modified.clone(),
+            Vec::new(),
+            modified,
+        );
         Ok(())
     }
 
@@ -1282,6 +1670,9 @@ impl Solid {
         if edge >= self.edges.len() {
             return Err(TopologyError::InvalidEdge(edge));
         }
+        let modified = vec![self
+            .persistent_edge_id(edge)
+            .ok_or(TopologyError::InvalidPersistentIdentity)?];
         let old_curve = core::mem::replace(&mut self.edges[edge].curve, curve);
         let old_tolerance = core::mem::replace(&mut self.edges[edge].tolerance, tolerance);
         if let Err(error) = self.validate_edge_curves() {
@@ -1289,6 +1680,13 @@ impl Solid {
             self.edges[edge].tolerance = old_tolerance;
             return Err(error);
         }
+        self.identity.record(
+            TopologyOperation::SetEdgeCurve,
+            Vec::new(),
+            modified.clone(),
+            Vec::new(),
+            modified,
+        );
         Ok(())
     }
 
@@ -1306,6 +1704,9 @@ impl Solid {
         if halfedge >= self.halfedges.len() || self.halfedges[halfedge].face != face {
             return Err(TopologyError::InvalidTrimHalfEdge(face, halfedge));
         }
+        let modified = vec![self
+            .persistent_face_id(face)
+            .ok_or(TopologyError::InvalidPersistentIdentity)?];
         let Some((loop_index, trim_index)) = self.find_trim(face, halfedge) else {
             return Err(TopologyError::InvalidTrimHalfEdge(face, halfedge));
         };
@@ -1323,6 +1724,13 @@ impl Solid {
             self.faces[face].trim_loops[loop_index].trims[trim_index].tolerance = old_tolerance;
             return Err(error);
         }
+        self.identity.record(
+            TopologyOperation::SetTrimCurve,
+            Vec::new(),
+            modified.clone(),
+            Vec::new(),
+            modified,
+        );
         Ok(())
     }
 
@@ -1344,6 +1752,9 @@ impl Solid {
         if !tolerance.is_finite() || tolerance < 0.0 {
             return Err(TopologyError::InvalidFace(face));
         }
+        let modified = vec![self
+            .persistent_face_id(face)
+            .ok_or(TopologyError::InvalidPersistentIdentity)?];
         let samples = samples.max(2);
         let old_loops = self.faces[face].trim_loops.clone();
         let trim_refs: Vec<(usize, usize, HalfEdgeId)> = self.faces[face]
@@ -1376,6 +1787,13 @@ impl Solid {
             self.faces[face].trim_loops = old_loops;
             return Err(error);
         }
+        self.identity.record(
+            TopologyOperation::GenerateFacePcurves,
+            Vec::new(),
+            modified.clone(),
+            Vec::new(),
+            modified,
+        );
         Ok(())
     }
 
@@ -1425,6 +1843,14 @@ impl Solid {
             ));
         }
 
+        let old_identity = self.identity.clone();
+        let a_face_id = self
+            .persistent_face_id(a_face)
+            .ok_or(TopologyError::InvalidPersistentIdentity)?;
+        let b_face_id = self
+            .persistent_face_id(b_face)
+            .ok_or(TopologyError::InvalidPersistentIdentity)?;
+        let split_persistent_id = self.identity.allocate_split_edge();
         let split_edge = self.split_edges.len();
         let a_split = self.faces[a_face].split_curves.len();
         let b_split = self.faces[b_face].split_curves.len();
@@ -1449,8 +1875,16 @@ impl Solid {
             self.faces[b_face].split_curves.pop();
             self.faces[a_face].split_curves.pop();
             self.split_edges.pop();
+            self.identity = old_identity;
             return Err(error);
         }
+        self.identity.record(
+            TopologyOperation::SplitFacesWithCurves,
+            vec![split_persistent_id],
+            vec![a_face_id, b_face_id],
+            Vec::new(),
+            vec![a_face_id, b_face_id],
+        );
 
         Ok(SplitFacesReport {
             split_edge,
@@ -1506,6 +1940,12 @@ impl Solid {
         let old_b_splits = self.faces[b_face].split_curves.clone();
         let old_a_loops = self.faces[a_face].trim_loops.clone();
         let old_b_loops = self.faces[b_face].trim_loops.clone();
+        let a_face_id = self
+            .persistent_face_id(a_face)
+            .ok_or(TopologyError::InvalidPersistentIdentity)?;
+        let b_face_id = self
+            .persistent_face_id(b_face)
+            .ok_or(TopologyError::InvalidPersistentIdentity)?;
 
         let (mut a_pcurve, a_snaps) =
             self.close_pcurve_gaps_to_face_boundary(a_face, a_pcurve, tolerance);
@@ -1558,6 +1998,13 @@ impl Solid {
                 self.split_edges = old_split_edges;
                 return Err(error);
             }
+            self.identity.record(
+                TopologyOperation::InstallTrimReadyFaceCurve,
+                Vec::new(),
+                vec![a_face_id, b_face_id],
+                Vec::new(),
+                vec![a_face_id, b_face_id],
+            );
 
             return Ok(TrimReadyFaceConversionReport {
                 kind: TrimReadyFaceConversionKind::ClosedInnerLoops,
@@ -2243,6 +2690,20 @@ fn finite_vec2(value: Vec2) -> bool {
 
 fn finite_point3(value: Point3) -> bool {
     value.x.is_finite() && value.y.is_finite() && value.z.is_finite()
+}
+
+fn validate_persistent_id_slice(
+    ids: &[PersistentId],
+    kind: PersistentTopologyKind,
+    next_serial: u64,
+    seen: &mut HashSet<PersistentId>,
+) -> Result<(), TopologyError> {
+    for id in ids {
+        if id.kind != kind || id.serial == 0 || id.serial >= next_serial || !seen.insert(*id) {
+            return Err(TopologyError::InvalidPersistentIdentity);
+        }
+    }
+    Ok(())
 }
 
 fn normalized_index(index: usize, samples: usize) -> f64 {
