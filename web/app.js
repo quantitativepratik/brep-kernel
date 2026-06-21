@@ -54,8 +54,8 @@ fn vs(@location(0) position: vec4<f32>, @location(1) normal: vec4<f32>) -> VsOut
 }
 
 @fragment
-fn fs(input: VsOut) -> @location(0) vec4<f32> {
-  let n = normalize(input.normal);
+fn fs(input: VsOut, @builtin(front_facing) frontFacing: bool) -> @location(0) vec4<f32> {
+  let n = select(-normalize(input.normal), normalize(input.normal), frontFacing);
   let l = normalize(uniforms.light.xyz);
   let diffuse = max(dot(n, l), 0.0);
   let rim = pow(1.0 - max(dot(n, vec3<f32>(0.0, 0.0, 1.0)), 0.0), 2.0);
@@ -109,7 +109,7 @@ async function main() {
     },
     primitive: {
       topology: "triangle-list",
-      cullMode: "back",
+      cullMode: "none",
     },
     depthStencil: {
       format: "depth24plus",
