@@ -77,6 +77,14 @@ pub enum TopologyOperation {
     SplitFacesWithCurves,
     /// A trim-ready intersection curve was promoted to face topology.
     InstallTrimReadyFaceCurve,
+    /// A vertex tolerance record was replaced.
+    SetVertexTolerance,
+    /// A coedge tolerance record was replaced.
+    SetCoedgeTolerance,
+    /// An edge tolerance record was replaced.
+    SetEdgeTolerance,
+    /// A face tolerance record was replaced.
+    SetFaceTolerance,
 }
 
 /// One persistent-history event for a topology mutation.
@@ -108,6 +116,227 @@ pub struct TopologyIdentity {
     next_serial: u64,
     revision: TopologyRevisionId,
     history: Vec<TopologyHistoryEvent>,
+}
+
+/// Per-vertex tolerance envelope.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VertexTolerance {
+    /// Model-space positional tolerance.
+    pub position: f64,
+}
+
+impl VertexTolerance {
+    /// Construct a vertex tolerance record.
+    pub fn new(position: f64) -> Self {
+        Self { position }
+    }
+
+    fn is_valid(self) -> bool {
+        self.position.is_finite() && self.position >= 0.0
+    }
+}
+
+/// Per-coedge tolerance envelope.
+///
+/// A coedge is represented by a directed [`HalfEdge`]. It can carry both
+/// model-space and parameter-space tolerances because each face side of the
+/// same edge may have a distinct p-curve.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CoedgeTolerance {
+    /// Model-space tolerance for this oriented edge use.
+    pub model: f64,
+    /// Face-parameter tolerance for this oriented edge use.
+    pub parameter: f64,
+}
+
+impl CoedgeTolerance {
+    /// Construct a coedge tolerance record.
+    pub fn new(model: f64, parameter: f64) -> Self {
+        Self { model, parameter }
+    }
+
+    /// Construct a coedge tolerance with the same value in both spaces.
+    pub fn uniform(tolerance: f64) -> Self {
+        Self {
+            model: tolerance,
+            parameter: tolerance,
+        }
+    }
+
+    fn is_valid(self) -> bool {
+        self.model.is_finite()
+            && self.model >= 0.0
+            && self.parameter.is_finite()
+            && self.parameter >= 0.0
+    }
+}
+
+/// Per-edge tolerance envelope.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EdgeTolerance {
+    /// Endpoint matching tolerance.
+    pub endpoint: f64,
+    /// Curve fitting/evaluation tolerance.
+    pub curve: f64,
+}
+
+impl EdgeTolerance {
+    /// Construct an edge tolerance record.
+    pub fn new(endpoint: f64, curve: f64) -> Self {
+        Self { endpoint, curve }
+    }
+
+    /// Construct an edge tolerance with the same endpoint and curve value.
+    pub fn uniform(tolerance: f64) -> Self {
+        Self {
+            endpoint: tolerance,
+            curve: tolerance,
+        }
+    }
+
+    fn is_valid(self) -> bool {
+        self.endpoint.is_finite()
+            && self.endpoint >= 0.0
+            && self.curve.is_finite()
+            && self.curve >= 0.0
+    }
+}
+
+/// Per-face tolerance envelope.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FaceTolerance {
+    /// Surface evaluation/projection tolerance.
+    pub surface: f64,
+    /// Trim-loop and p-curve closure tolerance.
+    pub trim: f64,
+    /// Normal/angular classification tolerance.
+    pub normal: f64,
+}
+
+impl FaceTolerance {
+    /// Construct a face tolerance record.
+    pub fn new(surface: f64, trim: f64, normal: f64) -> Self {
+        Self {
+            surface,
+            trim,
+            normal,
+        }
+    }
+
+    /// Construct a face tolerance with the same value in all components.
+    pub fn uniform(tolerance: f64) -> Self {
+        Self {
+            surface: tolerance,
+            trim: tolerance,
+            normal: tolerance,
+        }
+    }
+
+    fn is_valid(self) -> bool {
+        self.surface.is_finite()
+            && self.surface >= 0.0
+            && self.trim.is_finite()
+            && self.trim >= 0.0
+            && self.normal.is_finite()
+            && self.normal >= 0.0
+    }
+}
+
+/// Tolerance table aligned with a solid's topology arrays.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TopologyToleranceModel {
+    /// Per-vertex tolerance records.
+    pub vertices: Vec<VertexTolerance>,
+    /// Per-coedge tolerance records, aligned with `Solid::halfedges`.
+    pub coedges: Vec<CoedgeTolerance>,
+    /// Per-edge tolerance records.
+    pub edges: Vec<EdgeTolerance>,
+    /// Per-face tolerance records.
+    pub faces: Vec<FaceTolerance>,
+}
+
+impl TopologyToleranceModel {
+    /// Build a default tolerance table for a topology snapshot.
+    pub fn from_counts(
+        vertices: usize,
+        coedges: usize,
+        edges: usize,
+        faces: usize,
+        tolerance: f64,
+    ) -> Self {
+        Self {
+            vertices: vec![VertexTolerance::new(tolerance); vertices],
+            coedges: vec![CoedgeTolerance::uniform(tolerance); coedges],
+            edges: vec![EdgeTolerance::uniform(tolerance); edges],
+            faces: vec![FaceTolerance::uniform(tolerance); faces],
+        }
+    }
+}
+
+/// One operation that can be undone by a topology transaction rollback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopologyRollbackEntry {
+    /// Operation applied during the transaction.
+    pub operation: TopologyOperation,
+    /// Revision before the operation.
+    pub revision_before: TopologyRevisionId,
+    /// Revision after the operation.
+    pub revision_after: TopologyRevisionId,
+    /// Entities created by the operation.
+    pub created: Vec<PersistentId>,
+    /// Entities modified by the operation.
+    pub modified: Vec<PersistentId>,
+    /// Entities deleted by the operation.
+    pub deleted: Vec<PersistentId>,
+    /// Source entities used by the operation.
+    pub parents: Vec<PersistentId>,
+}
+
+/// Report returned by committing a topology transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopologyCommitReport {
+    /// Revision when the transaction began.
+    pub start_revision: TopologyRevisionId,
+    /// Revision after commit.
+    pub end_revision: TopologyRevisionId,
+    /// Operations committed by the transaction.
+    pub entries: Vec<TopologyRollbackEntry>,
+}
+
+/// Report returned by explicitly rolling back a topology transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopologyRollbackReport {
+    /// Revision when the transaction began and was restored.
+    pub restored_revision: TopologyRevisionId,
+    /// Operations undone by rollback, in reverse application order.
+    pub entries: Vec<TopologyRollbackEntry>,
+}
+
+impl TopologyRollbackEntry {
+    fn from_event(revision_before: TopologyRevisionId, event: &TopologyHistoryEvent) -> Self {
+        Self {
+            operation: event.operation,
+            revision_before,
+            revision_after: event.revision,
+            created: event.created.clone(),
+            modified: event.modified.clone(),
+            deleted: event.deleted.clone(),
+            parents: event.parents.clone(),
+        }
+    }
+}
+
+/// Transactional topology mutation guard.
+///
+/// A transaction groups several topology mutations against one [`Solid`]. If it
+/// is committed, the edits and normal history events remain. If it is rolled
+/// back, or dropped without commit, the original solid snapshot is restored.
+pub struct TopologyTransaction<'a> {
+    solid: &'a mut Solid,
+    before: Solid,
+    start_revision: TopologyRevisionId,
+    entries: Vec<TopologyRollbackEntry>,
+    completed: bool,
 }
 
 /// A topological vertex with geometric position.
@@ -796,6 +1025,8 @@ pub struct Solid {
     pub shells: Vec<Shell>,
     /// Persistent ids and mutation history for this topology snapshot.
     pub identity: TopologyIdentity,
+    /// Per-entity tolerance model aligned with the topology arrays.
+    pub tolerances: TopologyToleranceModel,
 }
 
 impl TopologyIdentity {
@@ -1097,6 +1328,8 @@ pub enum TopologyError {
     PcurveProjectionFailed(FaceId, HalfEdgeId),
     /// Persistent topology ids do not match the current topology arrays.
     InvalidPersistentIdentity,
+    /// Per-entity tolerance records are malformed or not aligned with topology arrays.
+    InvalidToleranceModel,
 }
 
 impl Solid {
@@ -1199,6 +1432,9 @@ impl Solid {
         let edge_tolerance = tolerance.max(DEFAULT_EDGE_TOLERANCE);
         for edge in &mut solid.edges {
             edge.tolerance = edge_tolerance;
+        }
+        for edge_tolerance_record in &mut solid.tolerances.edges {
+            *edge_tolerance_record = EdgeTolerance::uniform(edge_tolerance);
         }
         solid.validate()?;
         let modified = solid.identity.all_ids();
@@ -1325,6 +1561,13 @@ impl Solid {
                 triangle_count,
                 1,
             ),
+            tolerances: TopologyToleranceModel::from_counts(
+                point_count,
+                triangle_count * 3,
+                directed.len() / 2,
+                triangle_count,
+                DEFAULT_EDGE_TOLERANCE,
+            ),
         };
         solid.classify_planar_faces();
         solid.validate()?;
@@ -1361,9 +1604,23 @@ impl Solid {
         Self::from_triangle_mesh(v, &t)
     }
 
+    /// Begin a rollback-capable topology mutation transaction.
+    pub fn begin_topology_transaction(&mut self) -> TopologyTransaction<'_> {
+        let before = self.clone();
+        let start_revision = self.topology_revision();
+        TopologyTransaction {
+            solid: self,
+            before,
+            start_revision,
+            entries: Vec::new(),
+            completed: false,
+        }
+    }
+
     /// Validate internal half-edge adjacency.
     pub fn validate(&self) -> Result<(), TopologyError> {
         self.validate_persistent_identity()?;
+        self.validate_tolerance_model()?;
         for (id, he) in self.halfedges.iter().enumerate() {
             if self.halfedges[he.next].prev != id || self.halfedges[he.prev].next != id {
                 return Err(TopologyError::BrokenHalfEdge(id));
@@ -1379,6 +1636,41 @@ impl Solid {
         self.validate_edge_curves()?;
         self.validate_trim_topology()?;
         self.validate_face_splits()?;
+        Ok(())
+    }
+
+    /// Validate per-entity tolerance records.
+    pub fn validate_tolerance_model(&self) -> Result<(), TopologyError> {
+        if self.tolerances.vertices.len() != self.vertices.len()
+            || self.tolerances.coedges.len() != self.halfedges.len()
+            || self.tolerances.edges.len() != self.edges.len()
+            || self.tolerances.faces.len() != self.faces.len()
+        {
+            return Err(TopologyError::InvalidToleranceModel);
+        }
+        if !self
+            .tolerances
+            .vertices
+            .iter()
+            .all(|tolerance| tolerance.is_valid())
+            || !self
+                .tolerances
+                .coedges
+                .iter()
+                .all(|tolerance| tolerance.is_valid())
+            || !self
+                .tolerances
+                .edges
+                .iter()
+                .all(|tolerance| tolerance.is_valid())
+            || !self
+                .tolerances
+                .faces
+                .iter()
+                .all(|tolerance| tolerance.is_valid())
+        {
+            return Err(TopologyError::InvalidToleranceModel);
+        }
         Ok(())
     }
 
@@ -1501,6 +1793,156 @@ impl Solid {
         self.identity.shell(shell)
     }
 
+    /// Borrow the per-entity topology tolerance model.
+    pub fn tolerance_model(&self) -> &TopologyToleranceModel {
+        &self.tolerances
+    }
+
+    /// Tolerance record for a vertex.
+    pub fn vertex_tolerance(&self, vertex: VertexId) -> Option<VertexTolerance> {
+        self.tolerances.vertices.get(vertex).copied()
+    }
+
+    /// Tolerance record for a directed coedge/half-edge.
+    pub fn coedge_tolerance(&self, halfedge: HalfEdgeId) -> Option<CoedgeTolerance> {
+        self.tolerances.coedges.get(halfedge).copied()
+    }
+
+    /// Tolerance record for an undirected edge.
+    pub fn edge_tolerance(&self, edge: EdgeId) -> Option<EdgeTolerance> {
+        self.tolerances.edges.get(edge).copied()
+    }
+
+    /// Tolerance record for a face.
+    pub fn face_tolerance(&self, face: FaceId) -> Option<FaceTolerance> {
+        self.tolerances.faces.get(face).copied()
+    }
+
+    /// Replace a vertex tolerance record.
+    pub fn set_vertex_tolerance(
+        &mut self,
+        vertex: VertexId,
+        tolerance: VertexTolerance,
+    ) -> Result<(), TopologyError> {
+        if vertex >= self.vertices.len() {
+            return Err(TopologyError::InvalidVertex(vertex));
+        }
+        if !tolerance.is_valid() {
+            return Err(TopologyError::InvalidToleranceModel);
+        }
+        let modified = vec![self
+            .persistent_vertex_id(vertex)
+            .ok_or(TopologyError::InvalidPersistentIdentity)?];
+        let old = core::mem::replace(&mut self.tolerances.vertices[vertex], tolerance);
+        if let Err(error) = self.validate_tolerance_model() {
+            self.tolerances.vertices[vertex] = old;
+            return Err(error);
+        }
+        self.identity.record(
+            TopologyOperation::SetVertexTolerance,
+            Vec::new(),
+            modified.clone(),
+            Vec::new(),
+            modified,
+        );
+        Ok(())
+    }
+
+    /// Replace a coedge tolerance record.
+    pub fn set_coedge_tolerance(
+        &mut self,
+        halfedge: HalfEdgeId,
+        tolerance: CoedgeTolerance,
+    ) -> Result<(), TopologyError> {
+        if halfedge >= self.halfedges.len() {
+            return Err(TopologyError::BrokenHalfEdge(halfedge));
+        }
+        if !tolerance.is_valid() {
+            return Err(TopologyError::InvalidToleranceModel);
+        }
+        let modified = vec![self
+            .persistent_halfedge_id(halfedge)
+            .ok_or(TopologyError::InvalidPersistentIdentity)?];
+        let old = core::mem::replace(&mut self.tolerances.coedges[halfedge], tolerance);
+        if let Err(error) = self.validate_tolerance_model() {
+            self.tolerances.coedges[halfedge] = old;
+            return Err(error);
+        }
+        self.identity.record(
+            TopologyOperation::SetCoedgeTolerance,
+            Vec::new(),
+            modified.clone(),
+            Vec::new(),
+            modified,
+        );
+        Ok(())
+    }
+
+    /// Replace an edge tolerance record.
+    pub fn set_edge_tolerance(
+        &mut self,
+        edge: EdgeId,
+        tolerance: EdgeTolerance,
+    ) -> Result<(), TopologyError> {
+        if edge >= self.edges.len() {
+            return Err(TopologyError::InvalidEdge(edge));
+        }
+        if !tolerance.is_valid() {
+            return Err(TopologyError::InvalidToleranceModel);
+        }
+        let modified = vec![self
+            .persistent_edge_id(edge)
+            .ok_or(TopologyError::InvalidPersistentIdentity)?];
+        let old_model = core::mem::replace(&mut self.tolerances.edges[edge], tolerance);
+        let old_scalar = core::mem::replace(
+            &mut self.edges[edge].tolerance,
+            tolerance.endpoint.max(tolerance.curve),
+        );
+        if let Err(error) = self.validate_edge_curves() {
+            self.tolerances.edges[edge] = old_model;
+            self.edges[edge].tolerance = old_scalar;
+            return Err(error);
+        }
+        self.identity.record(
+            TopologyOperation::SetEdgeTolerance,
+            Vec::new(),
+            modified.clone(),
+            Vec::new(),
+            modified,
+        );
+        Ok(())
+    }
+
+    /// Replace a face tolerance record.
+    pub fn set_face_tolerance(
+        &mut self,
+        face: FaceId,
+        tolerance: FaceTolerance,
+    ) -> Result<(), TopologyError> {
+        if face >= self.faces.len() {
+            return Err(TopologyError::InvalidFace(face));
+        }
+        if !tolerance.is_valid() {
+            return Err(TopologyError::InvalidToleranceModel);
+        }
+        let modified = vec![self
+            .persistent_face_id(face)
+            .ok_or(TopologyError::InvalidPersistentIdentity)?];
+        let old = core::mem::replace(&mut self.tolerances.faces[face], tolerance);
+        if let Err(error) = self.validate_trim_topology() {
+            self.tolerances.faces[face] = old;
+            return Err(error);
+        }
+        self.identity.record(
+            TopologyOperation::SetFaceTolerance,
+            Vec::new(),
+            modified.clone(),
+            Vec::new(),
+            modified,
+        );
+        Ok(())
+    }
+
     /// Validate model-space curves attached to topological edges.
     pub fn validate_edge_curves(&self) -> Result<(), TopologyError> {
         for (edge_id, edge) in self.edges.iter().enumerate() {
@@ -1518,7 +1960,16 @@ impl Solid {
             let Some((origin, destination)) = self.edge_points(edge_id) else {
                 return Err(TopologyError::InvalidEdge(edge_id));
             };
-            let tolerance = edge.tolerance.max(DEFAULT_EDGE_TOLERANCE);
+            let edge_tolerance = self
+                .tolerances
+                .edges
+                .get(edge_id)
+                .ok_or(TopologyError::InvalidToleranceModel)?;
+            let tolerance = edge
+                .tolerance
+                .max(edge_tolerance.endpoint)
+                .max(edge_tolerance.curve)
+                .max(DEFAULT_EDGE_TOLERANCE);
             let forward = curve_start.distance(origin) <= tolerance
                 && curve_end.distance(destination) <= tolerance;
             let reverse = curve_start.distance(destination) <= tolerance
@@ -1675,9 +2126,14 @@ impl Solid {
             .ok_or(TopologyError::InvalidPersistentIdentity)?];
         let old_curve = core::mem::replace(&mut self.edges[edge].curve, curve);
         let old_tolerance = core::mem::replace(&mut self.edges[edge].tolerance, tolerance);
+        let old_model_tolerance = core::mem::replace(
+            &mut self.tolerances.edges[edge],
+            EdgeTolerance::uniform(tolerance),
+        );
         if let Err(error) = self.validate_edge_curves() {
             self.edges[edge].curve = old_curve;
             self.edges[edge].tolerance = old_tolerance;
+            self.tolerances.edges[edge] = old_model_tolerance;
             return Err(error);
         }
         self.identity.record(
@@ -1719,9 +2175,14 @@ impl Solid {
             &mut self.faces[face].trim_loops[loop_index].trims[trim_index].tolerance,
             tolerance,
         );
+        let old_coedge_tolerance = core::mem::replace(
+            &mut self.tolerances.coedges[halfedge],
+            CoedgeTolerance::uniform(tolerance),
+        );
         if let Err(error) = self.validate_trim_topology() {
             self.faces[face].trim_loops[loop_index].trims[trim_index].curve = old_curve;
             self.faces[face].trim_loops[loop_index].trims[trim_index].tolerance = old_tolerance;
+            self.tolerances.coedges[halfedge] = old_coedge_tolerance;
             return Err(error);
         }
         self.identity.record(
@@ -1757,6 +2218,7 @@ impl Solid {
             .ok_or(TopologyError::InvalidPersistentIdentity)?];
         let samples = samples.max(2);
         let old_loops = self.faces[face].trim_loops.clone();
+        let old_face_tolerance = self.tolerances.faces[face];
         let trim_refs: Vec<(usize, usize, HalfEdgeId)> = self.faces[face]
             .trim_loops
             .iter()
@@ -1772,19 +2234,34 @@ impl Solid {
                     })
             })
             .collect();
+        let old_coedge_tolerances: Vec<(HalfEdgeId, CoedgeTolerance)> = trim_refs
+            .iter()
+            .map(|(_, _, halfedge)| (*halfedge, self.tolerances.coedges[*halfedge]))
+            .collect();
 
         for (loop_index, trim_index, halfedge) in trim_refs {
             let Some(pcurve) = self.pcurve_for_halfedge(face, halfedge, samples, tolerance) else {
                 self.faces[face].trim_loops = old_loops;
+                self.tolerances.faces[face] = old_face_tolerance;
+                for (old_halfedge, old_tolerance) in old_coedge_tolerances {
+                    self.tolerances.coedges[old_halfedge] = old_tolerance;
+                }
                 return Err(TopologyError::PcurveProjectionFailed(face, halfedge));
             };
             self.faces[face].trim_loops[loop_index].trims[trim_index].curve = pcurve;
             self.faces[face].trim_loops[loop_index].trims[trim_index].tolerance = tolerance;
+            self.tolerances.coedges[halfedge] = CoedgeTolerance::uniform(tolerance);
         }
+        self.tolerances.faces[face].trim = tolerance;
+        self.tolerances.faces[face].surface = self.tolerances.faces[face].surface.max(tolerance);
         self.normalize_face_trim_loop_parameters(face, tolerance);
 
         if let Err(error) = self.validate_trim_topology() {
             self.faces[face].trim_loops = old_loops;
+            self.tolerances.faces[face] = old_face_tolerance;
+            for (old_halfedge, old_tolerance) in old_coedge_tolerances {
+                self.tolerances.coedges[old_halfedge] = old_tolerance;
+            }
             return Err(error);
         }
         self.identity.record(
@@ -2511,6 +2988,23 @@ impl Solid {
             let tolerance = trim
                 .tolerance
                 .max(next_trim.tolerance)
+                .max(
+                    trim.halfedge
+                        .and_then(|halfedge| self.tolerances.coedges.get(halfedge))
+                        .map_or(0.0, |tolerance| tolerance.parameter),
+                )
+                .max(
+                    next_trim
+                        .halfedge
+                        .and_then(|halfedge| self.tolerances.coedges.get(halfedge))
+                        .map_or(0.0, |tolerance| tolerance.parameter),
+                )
+                .max(
+                    self.tolerances
+                        .faces
+                        .get(face_id)
+                        .map_or(0.0, |tolerance| tolerance.trim),
+                )
                 .max(DEFAULT_TRIM_TOLERANCE);
             if surface_parameter_distance(&self.faces[face_id].surface, end, next_start, tolerance)
                 > tolerance
@@ -2608,6 +3102,187 @@ impl Solid {
         let surface = self.faces[face].surface.clone();
         for trim_loop in &mut self.faces[face].trim_loops {
             normalize_trim_loop_parameters(trim_loop, &surface, tolerance);
+        }
+    }
+}
+
+impl<'a> TopologyTransaction<'a> {
+    /// Borrow the in-progress solid snapshot.
+    pub fn solid(&self) -> &Solid {
+        self.solid
+    }
+
+    /// Current rollback entries in application order.
+    pub fn rollback_entries(&self) -> &[TopologyRollbackEntry] {
+        &self.entries
+    }
+
+    /// Commit all mutations in the transaction.
+    pub fn commit(mut self) -> Result<TopologyCommitReport, TopologyError> {
+        if let Err(error) = self.solid.validate() {
+            *self.solid = self.before.clone();
+            self.completed = true;
+            return Err(error);
+        }
+        let report = TopologyCommitReport {
+            start_revision: self.start_revision,
+            end_revision: self.solid.topology_revision(),
+            entries: self.entries.clone(),
+        };
+        self.completed = true;
+        Ok(report)
+    }
+
+    /// Roll back all mutations in the transaction and return an undo report.
+    pub fn rollback(mut self) -> TopologyRollbackReport {
+        let mut entries = self.entries.clone();
+        entries.reverse();
+        *self.solid = self.before.clone();
+        self.completed = true;
+        TopologyRollbackReport {
+            restored_revision: self.start_revision,
+            entries,
+        }
+    }
+
+    /// Replace a face support surface inside this transaction.
+    pub fn set_face_surface(
+        &mut self,
+        face: FaceId,
+        surface: FaceSurface,
+    ) -> Result<(), TopologyError> {
+        self.capture_operation(|solid| solid.set_face_surface(face, surface))
+    }
+
+    /// Replace a face's trim loops inside this transaction.
+    pub fn set_face_trim_loops(
+        &mut self,
+        face: FaceId,
+        trim_loops: Vec<TrimLoop>,
+    ) -> Result<(), TopologyError> {
+        self.capture_operation(|solid| solid.set_face_trim_loops(face, trim_loops))
+    }
+
+    /// Replace an edge curve inside this transaction.
+    pub fn set_edge_curve(
+        &mut self,
+        edge: EdgeId,
+        curve: EdgeCurve3D,
+        tolerance: f64,
+    ) -> Result<(), TopologyError> {
+        self.capture_operation(|solid| solid.set_edge_curve(edge, curve, tolerance))
+    }
+
+    /// Replace one face-side p-curve inside this transaction.
+    pub fn set_trim_curve(
+        &mut self,
+        face: FaceId,
+        halfedge: HalfEdgeId,
+        curve: TrimCurve2D,
+        tolerance: f64,
+    ) -> Result<(), TopologyError> {
+        self.capture_operation(|solid| solid.set_trim_curve(face, halfedge, curve, tolerance))
+    }
+
+    /// Generate p-curves for a face inside this transaction.
+    pub fn generate_face_pcurves(
+        &mut self,
+        face: FaceId,
+        samples: usize,
+        tolerance: f64,
+    ) -> Result<(), TopologyError> {
+        self.capture_operation(|solid| solid.generate_face_pcurves(face, samples, tolerance))
+    }
+
+    /// Install a staged split curve inside this transaction.
+    pub fn split_faces_with_curves(
+        &mut self,
+        a_face: FaceId,
+        b_face: FaceId,
+        edge_curve: EdgeCurve3D,
+        a_pcurve: TrimCurve2D,
+        b_pcurve: TrimCurve2D,
+        tolerance: f64,
+    ) -> Result<SplitFacesReport, TopologyError> {
+        self.capture_operation(|solid| {
+            solid.split_faces_with_curves(a_face, b_face, edge_curve, a_pcurve, b_pcurve, tolerance)
+        })
+    }
+
+    /// Promote a trim-ready curve inside this transaction.
+    pub fn install_trim_ready_face_curve(
+        &mut self,
+        a_face: FaceId,
+        b_face: FaceId,
+        edge_curve: EdgeCurve3D,
+        a_pcurve: TrimCurve2D,
+        b_pcurve: TrimCurve2D,
+        tolerance: f64,
+    ) -> Result<TrimReadyFaceConversionReport, TopologyError> {
+        self.capture_operation(|solid| {
+            solid.install_trim_ready_face_curve(
+                a_face, b_face, edge_curve, a_pcurve, b_pcurve, tolerance,
+            )
+        })
+    }
+
+    /// Replace a vertex tolerance inside this transaction.
+    pub fn set_vertex_tolerance(
+        &mut self,
+        vertex: VertexId,
+        tolerance: VertexTolerance,
+    ) -> Result<(), TopologyError> {
+        self.capture_operation(|solid| solid.set_vertex_tolerance(vertex, tolerance))
+    }
+
+    /// Replace a coedge tolerance inside this transaction.
+    pub fn set_coedge_tolerance(
+        &mut self,
+        halfedge: HalfEdgeId,
+        tolerance: CoedgeTolerance,
+    ) -> Result<(), TopologyError> {
+        self.capture_operation(|solid| solid.set_coedge_tolerance(halfedge, tolerance))
+    }
+
+    /// Replace an edge tolerance inside this transaction.
+    pub fn set_edge_tolerance(
+        &mut self,
+        edge: EdgeId,
+        tolerance: EdgeTolerance,
+    ) -> Result<(), TopologyError> {
+        self.capture_operation(|solid| solid.set_edge_tolerance(edge, tolerance))
+    }
+
+    /// Replace a face tolerance inside this transaction.
+    pub fn set_face_tolerance(
+        &mut self,
+        face: FaceId,
+        tolerance: FaceTolerance,
+    ) -> Result<(), TopologyError> {
+        self.capture_operation(|solid| solid.set_face_tolerance(face, tolerance))
+    }
+
+    fn capture_operation<T>(
+        &mut self,
+        operation: impl FnOnce(&mut Solid) -> Result<T, TopologyError>,
+    ) -> Result<T, TopologyError> {
+        let revision_before = self.solid.topology_revision();
+        let history_len_before = self.solid.topology_history().len();
+        let result = operation(self.solid);
+        if result.is_ok() && self.solid.topology_history().len() > history_len_before {
+            if let Some(event) = self.solid.topology_history().last() {
+                self.entries
+                    .push(TopologyRollbackEntry::from_event(revision_before, event));
+            }
+        }
+        result
+    }
+}
+
+impl Drop for TopologyTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            *self.solid = self.before.clone();
         }
     }
 }
